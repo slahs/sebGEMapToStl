@@ -1,5 +1,5 @@
 """
-Map-to-STL v3.0 - Clean Edition
+Map-to-STL v3.1 - Clean Edition
 Created by SebGE - https://makerworld.com/de/@SebGE
 
 3 Modes:
@@ -27,10 +27,12 @@ def create_heart(s=10):
 def create_star(s=10):
     angles=np.linspace(-np.pi/2,3*np.pi/2,11)[:-1];coords=[]
     for i,a in enumerate(angles):r=s/2 if i%2==0 else s/5;coords.append((r*np.cos(a),r*np.sin(a)))
-    return coords and Polygon(coords)
+    return Polygon(coords)
 def create_pin(s=10):
     t=np.linspace(0,2*np.pi,40);r=s/2*(1-0.3*np.cos(t));return Polygon(list(zip(r*np.sin(t),r*np.cos(t)*0.7+s*0.15)))
-MARKERS={'heart':create_heart,'star':create_star,'pin':create_pin,'none':None}
+def create_circle(s=10):
+    t=np.linspace(0,2*np.pi,50);return Polygon([(s/2*np.cos(a),s/2*np.sin(a)) for a in t])
+MARKERS={'heart':create_heart,'star':create_star,'pin':create_pin,'circle':create_circle,'none':None}
 
 # ==================== GEOCODING ====================
 def geocode(q):
@@ -45,7 +47,7 @@ def geocode(q):
             if -90<=lat<=90 and -180<=lon<=180:return{'lat':lat,'lon':lon,'name':f'{lat:.4f}, {lon:.4f}'}
     except:pass
     try:
-        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'MapToSTL/3.0'},timeout=10)
+        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'MapToSTL/3.1'},timeout=10)
         if r.ok and r.json():d=r.json()[0];return{'lat':float(d['lat']),'lon':float(d['lon']),'name':d.get('display_name',q)[:50]}
     except:pass
     return None
@@ -65,7 +67,6 @@ def fetch_streets(lat,lon,radius):
                 if len(coords)>=2:lines.append(LineString(coords))
         if lines:return gpd.GeoDataFrame(geometry=lines,crs='EPSG:4326')
     except Exception as ex:print(f"Streets error: {ex}")
-    # Demo fallback
     import random;random.seed(int(abs(lat*1000+lon*100)));dl=radius/111320;dlo=dl/np.cos(np.radians(lat));lines=[]
     for i in range(6):
         y=lat-dl+(2*dl*i/5);lines.append(LineString([(lon-dlo+(2*dlo*j/20),y+random.uniform(-dl*.02,dl*.02)) for j in range(21)]))
@@ -101,7 +102,7 @@ def fetch_buildings(lat,lon,radius):
 
 def fetch_water(lat,lon,radius):
     bbox=radius/111000
-    q=f'[out:json][timeout:60];(way["natural"="water"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});way["waterway"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});relation["natural"="water"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5}););out body;>;out skel qt;'
+    q=f'[out:json][timeout:60];(way["natural"="water"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});way["waterway"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5}););out body;>;out skel qt;'
     try:
         r=requests.post('https://overpass-api.de/api/interpreter',data={'data':q},timeout=60)
         if not r.ok:return[]
@@ -131,34 +132,65 @@ def fetch_elevation(lat,lon,radius,res=80):
             grid=np.array(elevs).reshape(8,8)
             return zoom(grid,res/8,order=3),lats,lons
     except:pass
-    # Procedural terrain
     np.random.seed(int(abs(lat*1000+lon*100)));x,y=np.meshgrid(np.linspace(0,4,res),np.linspace(0,4,res))
     t=np.zeros((res,res))
     for f,a in [(1,400),(2,200),(4,100),(8,50)]:t+=a*(np.sin(f*x+np.random.rand()*10)*np.cos(f*y+np.random.rand()*10)+1)/2
     return 200+(t-t.min())/(t.max()-t.min())*1500,lats,lons
 
 # ==================== MESH GENERATION ====================
-def create_streets_mesh(gdf,lat,lon,radius,size,height,lw):
+def create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker_type='none',marker_size=10,marker_gap=0):
     gp=gdf.to_crs(gdf.estimate_utm_crs())
     ctr=gpd.GeoDataFrame(geometry=gpd.points_from_xy([lon],[lat]),crs='EPSG:4326').to_crs(gp.crs).geometry.iloc[0]
     bb=box(ctr.x-radius,ctr.y-radius,ctr.x+radius,ctr.y+radius);cl=gp.clip(bb)
     if cl.empty:raise ValueError("No data")
     sc=size/(2*radius);buf=lw/sc/2
+    
+    # Create marker and gap polygons
+    marker_poly=None
+    gap_poly=None
+    if marker_type!='none' and marker_type in MARKERS and MARKERS[marker_type]:
+        marker_poly=MARKERS[marker_type](marker_size)
+        if marker_gap>0:
+            gap_poly=marker_poly.buffer(marker_gap)
+    
     uni=unary_union(cl.geometry.buffer(buf,cap_style=2,join_style=2)).simplify(0.3)
+    
     def norm(p):
         c=np.array(p.exterior.coords);c[:,0]=(c[:,0]-ctr.x)*sc;c[:,1]=(c[:,1]-ctr.y)*sc
         holes=[((np.array(i.coords)-[ctr.x,ctr.y])*sc).tolist() for i in p.interiors]
         return Polygon(c.tolist(),holes)
+    
     polys=[norm(p) for p in(uni.geoms if hasattr(uni,'geoms')else[uni]) if not p.is_empty]
+    
+    # Combine street polygons
+    streets=unary_union(polys) if len(polys)>1 else (polys[0] if polys else None)
+    if not streets:raise ValueError("No streets")
+    
+    # Cut gap from streets if marker with gap
+    if gap_poly and not gap_poly.is_empty:
+        streets=streets.difference(gap_poly)
+    
     meshes=[]
-    for p in polys:
-        if p.area<0.1:continue
-        try:m=trimesh.creation.extrude_polygon(p,height);meshes.append(m) if m else None
+    
+    # Add street meshes
+    for p in(streets.geoms if hasattr(streets,'geoms')else[streets]):
+        if p.is_empty or p.area<0.1:continue
+        try:m=trimesh.creation.extrude_polygon(p,height);meshes.append(m)
         except:pass
+    
+    # Add marker mesh
+    if marker_poly and not marker_poly.is_empty:
+        try:
+            marker_mesh=trimesh.creation.extrude_polygon(marker_poly,height)
+            meshes.append(marker_mesh)
+        except:pass
+    
     if not meshes:raise ValueError("No mesh")
-    return trimesh.util.concatenate(meshes)
+    result=trimesh.util.concatenate(meshes)
+    result.fill_holes();result.fix_normals()
+    return result
 
-def create_city_mesh(lat,lon,radius,size,street_h,building_scale,base_h):
+def create_city_mesh(lat,lon,radius,size,street_h,lw,building_scale,base_h):
     gdf=fetch_streets(lat,lon,radius)
     buildings=fetch_buildings(lat,lon,radius)
     water=fetch_water(lat,lon,radius)
@@ -176,7 +208,7 @@ def create_city_mesh(lat,lon,radius,size,street_h,building_scale,base_h):
     # Streets on base
     bb=box(ctr.x-radius,ctr.y-radius,ctr.x+radius,ctr.y+radius);cl=gp.clip(bb)
     if not cl.empty:
-        uni=unary_union(cl.geometry.buffer(1.5/sc,cap_style=2)).simplify(0.3)
+        uni=unary_union(cl.geometry.buffer(lw/sc,cap_style=2)).simplify(0.3)
         for p in(uni.geoms if hasattr(uni,'geoms')else[uni]):
             if p.is_empty or p.area<1:continue
             c=np.array(p.exterior.coords);c[:,0]=(c[:,0]-ctr.x)*sc;c[:,1]=(c[:,1]-ctr.y)*sc
@@ -211,7 +243,9 @@ def create_city_mesh(lat,lon,radius,size,street_h,building_scale,base_h):
             meshes.append(m)
         except:pass
     
-    return trimesh.util.concatenate(meshes)
+    result=trimesh.util.concatenate(meshes)
+    result.fill_holes();result.fix_normals()
+    return result
 
 def create_terrain_mesh(lat,lon,radius,size,height_scale,base_h):
     elev,_,_=fetch_elevation(lat,lon,radius,80)
@@ -257,97 +291,87 @@ HTML='''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" c
 :root{--g:#00AE42;--gd:#009639;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
 body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height:100vh;overflow:hidden}
 .app{display:grid;grid-template-columns:280px 1fr 280px;height:100vh}
-.panel{background:var(--c);padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+.panel{background:var(--c);padding:16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto}
 .panel::-webkit-scrollbar{width:6px}
 .panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}
 
-/* Header */
-.logo{display:flex;align-items:center;gap:10px;padding-bottom:14px;border-bottom:1px solid var(--br)}
-.logo-icon{width:40px;height:40px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
-.logo h1{font-size:16px;font-weight:700}
+.logo{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--br)}
+.logo-icon{width:38px;height:38px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.logo h1{font-size:15px;font-weight:700}
 .logo small{display:block;font-size:9px;color:var(--g);font-weight:500;margin-top:2px}
 
-/* Creator */
 .creator{display:flex;align-items:center;gap:10px;background:var(--c2);border:1px solid var(--g);border-radius:8px;padding:10px;text-decoration:none;transition:all .2s}
 .creator:hover{background:rgba(0,174,66,.1);transform:translateY(-1px)}
-.cr-av{width:32px;height:32px;background:var(--g);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px}
+.cr-av{width:30px;height:30px;background:var(--g);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px}
 .cr-name{font-size:11px;font-weight:600}
 .cr-link{font-size:9px;color:var(--g)}
 .cr-badge{margin-left:auto;font-size:8px;background:var(--g);padding:3px 6px;border-radius:4px;font-weight:700}
 
-/* Search */
 .search{position:relative}
-.search input{width:100%;padding:10px 12px 10px 36px;background:var(--c2);border:1px solid var(--br);border-radius:8px;color:var(--t);font-size:12px}
+.search input{width:100%;padding:10px 12px 10px 34px;background:var(--c2);border:1px solid var(--br);border-radius:8px;color:var(--t);font-size:12px}
 .search input:focus{outline:none;border-color:var(--g)}
-.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--t2);width:16px;height:16px}
-.coords{display:flex;gap:8px;margin-top:6px}
-.coord{flex:1;background:var(--c2);border-radius:6px;padding:6px 8px;font-size:10px}
+.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--t2);width:14px;height:14px}
+.coords{display:flex;gap:6px;margin-top:6px}
+.coord{flex:1;background:var(--c2);border-radius:6px;padding:6px 8px;font-size:9px}
 .coord label{color:var(--t2);font-size:8px;text-transform:uppercase}
 .coord span{color:var(--g);font-family:monospace;font-weight:600}
 
-/* Section */
-.sec{background:var(--c2);border-radius:10px;padding:12px}
-.sec-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--g);margin-bottom:10px}
+.sec{background:var(--c2);border-radius:8px;padding:10px}
+.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--g);margin-bottom:8px}
 
-/* Mode Tabs */
-.modes{display:flex;gap:6px}
-.mode{flex:1;padding:12px 8px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center;transition:all .15s}
+.modes{display:flex;gap:4px}
+.mode{flex:1;padding:10px 6px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;transition:all .15s}
 .mode:hover{border-color:var(--g)}
 .mode.active{border-color:var(--g);background:rgba(0,174,66,.1)}
-.mode .icon{font-size:22px}
-.mode .name{font-size:10px;font-weight:600;margin-top:4px}
-.mode .desc{font-size:8px;color:var(--t2);margin-top:2px}
+.mode .icon{font-size:18px}
+.mode .name{font-size:9px;font-weight:600;margin-top:3px}
+.mode .desc{font-size:7px;color:var(--t2);margin-top:1px}
 
-/* Markers */
-.markers{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
-.marker{padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;font-size:16px;transition:all .15s}
+.markers{display:grid;grid-template-columns:repeat(5,1fr);gap:4px}
+.marker{padding:6px 2px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;font-size:14px;transition:all .15s}
 .marker:hover{border-color:var(--g)}
 .marker.active{border-color:var(--g);background:rgba(0,174,66,.1)}
-.marker span{display:block;font-size:8px;margin-top:2px}
+.marker span{display:block;font-size:7px;margin-top:2px}
 
-/* Slider */
-.slider{margin-bottom:8px}
-.slider-head{display:flex;justify-content:space-between;margin-bottom:4px}
+.slider{margin-bottom:6px}
+.slider-head{display:flex;justify-content:space-between;margin-bottom:3px}
 .slider label{font-size:10px;color:var(--t2)}
 .slider .val{font-size:10px;color:var(--g);font-family:monospace;font-weight:600}
 .slider input{width:100%;height:4px;background:var(--c);border-radius:2px;-webkit-appearance:none}
-.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}
+.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--g);border-radius:50%;cursor:pointer}
 
-/* Buttons */
-.btn{padding:12px;border:none;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all .15s}
+.btn{padding:10px;border:none;border-radius:6px;font-size:10px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;transition:all .15s}
 .btn-primary{background:linear-gradient(135deg,var(--g),var(--gd));color:#fff}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,174,66,.3)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,174,66,.3)}
 .btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}
 .btn-secondary:hover{border-color:var(--g);color:var(--g)}
 .btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 
-/* Status */
 .status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}
 .status.error{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}
 .status.success{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--g)}
 
-/* Map */
 .map-container{position:relative;background:var(--c)}
 #map{width:100%;height:100%}
-.map-overlay{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);padding:8px 16px;border-radius:20px;font-size:10px;color:var(--t2)}
+.map-overlay{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);padding:6px 14px;border-radius:20px;font-size:9px;color:var(--t2)}
 
-/* 3D Preview */
-.preview-title{font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px}
-.preview-title .badge{font-size:8px;background:var(--g);color:#fff;padding:2px 8px;border-radius:10px}
-#preview3d{flex:1;background:var(--c2);border-radius:10px;min-height:200px;display:flex;align-items:center;justify-content:center;color:var(--t2);font-size:11px}
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.stat{background:var(--c2);border-radius:6px;padding:8px;text-align:center}
-.stat label{font-size:8px;color:var(--t2);text-transform:uppercase}
-.stat .val{font-size:12px;color:var(--g);font-family:monospace;font-weight:600;margin-top:2px}
-.info{font-size:9px;color:var(--t2);line-height:1.5;background:var(--c2);border-radius:6px;padding:10px}
+.preview-title{font-size:11px;font-weight:600;display:flex;align-items:center;gap:8px}
+.preview-title .badge{font-size:8px;background:var(--g);color:#fff;padding:2px 6px;border-radius:10px}
+#preview3d{flex:1;background:var(--c2);border-radius:8px;min-height:180px;display:flex;align-items:center;justify-content:center;color:var(--t2);font-size:10px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.stat{background:var(--c2);border-radius:6px;padding:6px;text-align:center}
+.stat label{font-size:7px;color:var(--t2);text-transform:uppercase}
+.stat .val{font-size:11px;color:var(--g);font-family:monospace;font-weight:600;margin-top:2px}
+.info{font-size:8px;color:var(--t2);line-height:1.4;background:var(--c2);border-radius:6px;padding:8px}
 .info strong{color:var(--g)}
-.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:10px;border-top:1px solid var(--br)}
+.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}
 .footer a{color:var(--g);text-decoration:none}
 
-/* Spinner */
-.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
+.spinner{width:12px;height:12px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+
+.marker-opts{margin-top:8px;padding-top:8px;border-top:1px solid var(--br)}
 
 @media(max-width:900px){.app{grid-template-columns:1fr}.panel{display:none}}
 </style></head><body>
@@ -396,6 +420,13 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height
 <div class="marker" data-m="heart" onclick="setMarker('heart')">❤️<span>Heart</span></div>
 <div class="marker" data-m="star" onclick="setMarker('star')">⭐<span>Star</span></div>
 <div class="marker" data-m="pin" onclick="setMarker('pin')">📍<span>Pin</span></div>
+<div class="marker" data-m="circle" onclick="setMarker('circle')">⭕<span>Circle</span></div>
+</div>
+<div class="marker-opts" id="markerOpts" style="display:none">
+<div class="slider"><div class="slider-head"><label>Marker Size</label><span class="val" id="msV">12mm</span></div>
+<input type="range" id="ms" min="5" max="25" value="12" step="1" oninput="$('msV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Gap (Frame)</label><span class="val" id="mgV">2mm</span></div>
+<input type="range" id="mg" min="0" max="5" value="2" step="0.5" oninput="$('mgV').textContent=this.value+'mm'"></div>
 </div>
 </div>
 
@@ -403,8 +434,10 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height
 <div class="sec-title">Settings</div>
 <div class="slider"><div class="slider-head"><label>Radius</label><span class="val" id="radV">500m</span></div>
 <input type="range" id="rad" min="100" max="3000" value="500" step="50" oninput="updRad()"></div>
-<div class="slider"><div class="slider-head"><label>Size</label><span class="val" id="sizeV">80mm</span></div>
+<div class="slider"><div class="slider-head"><label>Model Size</label><span class="val" id="sizeV">80mm</span></div>
 <input type="range" id="size" min="30" max="200" value="80" step="5" oninput="$('sizeV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Line Width</label><span class="val" id="lwV">1.2mm</span></div>
+<input type="range" id="lw" min="0.4" max="3" value="1.2" step="0.1" oninput="$('lwV').textContent=this.value+'mm'"></div>
 <div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="htV">2mm</span></div>
 <input type="range" id="ht" min="1" max="10" value="2" step="0.5" oninput="$('htV').textContent=this.value+'mm'"></div>
 </div>
@@ -434,10 +467,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height
 <div class="status" id="status"></div>
 
 <div class="info">
-<strong>🖨️ Print Tips:</strong><br>
-• Streets: Great for laser cut or single color<br>
-• City: Buildings + water for realistic model<br>
-• Terrain: Mountains with real elevation data
+<strong>🎨 Marker Gap:</strong> Creates a frame around the marker so you can print it in a different color in Bambu Studio!
 </div>
 
 <div class="footer">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
@@ -447,17 +477,14 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-let map,marker,circle,lat=51.2277,lon=6.7735,mode='streets',markerType='none';
-let scene,camera,renderer,mesh,controls;
+let map,mapMarker,circle,lat=51.2277,lon=6.7735,mode='streets',markerType='none';
+let scene,camera,renderer,mesh;
 
 function init(){
-    // Map
     map=L.map('map',{zoomControl:false}).setView([lat,lon],14);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
     updateMap();
     map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;updateMap();updateCoords()});
-    
-    // 3D Scene
     init3D();
 }
 
@@ -465,21 +492,15 @@ function init3D(){
     const container=$('preview3d');
     scene=new THREE.Scene();
     scene.background=new THREE.Color(0x1e1e1e);
-    
     camera=new THREE.PerspectiveCamera(45,container.clientWidth/container.clientHeight,0.1,1000);
     camera.position.set(80,80,80);
     camera.lookAt(0,0,0);
-    
     renderer=new THREE.WebGLRenderer({antialias:true});
     renderer.setSize(container.clientWidth,container.clientHeight);
-    
-    // Lights
     scene.add(new THREE.AmbientLight(0xffffff,0.6));
     const dir=new THREE.DirectionalLight(0xffffff,0.8);
     dir.position.set(50,100,50);
     scene.add(dir);
-    
-    // Grid
     const grid=new THREE.GridHelper(100,10,0x333333,0x222222);
     grid.rotation.x=Math.PI/2;
     scene.add(grid);
@@ -487,9 +508,9 @@ function init3D(){
 
 function updateMap(){
     const r=+$('rad').value;
-    if(marker)map.removeLayer(marker);
+    if(mapMarker)map.removeLayer(mapMarker);
     if(circle)map.removeLayer(circle);
-    marker=L.marker([lat,lon],{icon:L.divIcon({html:'<div style="width:14px;height:14px;background:#00AE42;border:2px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.3)"></div>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map);
+    mapMarker=L.marker([lat,lon],{icon:L.divIcon({html:'<div style="width:12px;height:12px;background:#00AE42;border:2px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.3)"></div>',iconSize:[12,12],iconAnchor:[6,6]})}).addTo(map);
     circle=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.05,weight:2}).addTo(map);
 }
 
@@ -514,6 +535,7 @@ function setMode(m){
 function setMarker(m){
     markerType=m;
     document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('active',el.dataset.m===m));
+    $('markerOpts').style.display=m==='none'?'none':'block';
 }
 
 async function search(){
@@ -526,7 +548,7 @@ async function search(){
         lat=d.lat;lon=d.lon;
         map.setView([lat,lon],14);
         updateMap();updateCoords();
-        msg('success','✓ Found: '+d.name.substring(0,30));
+        msg('success','✓ '+d.name.substring(0,30));
     }catch(e){msg('error',e.message)}
 }
 
@@ -537,12 +559,20 @@ async function preview(){
         const r=await fetch('/api/preview',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,mode,marker:markerType})
+            body:JSON.stringify({
+                lat,lon,
+                radius:+$('rad').value,
+                size:+$('size').value,
+                height:+$('ht').value,
+                lineWidth:+$('lw').value,
+                mode,
+                marker:markerType,
+                markerSize:+$('ms').value,
+                markerGap:+$('mg').value
+            })
         });
         const d=await r.json();
         if(d.error)throw new Error(d.error);
-        
-        // Load 3D preview
         load3DPreview(d.vertices,d.faces);
         $('statData').textContent=d.count+(mode==='city'?' bldgs':' segs');
         $('badge').style.display='inline';
@@ -552,36 +582,25 @@ async function preview(){
 }
 
 function load3DPreview(verts,faces){
-    // Remove old mesh
     if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}
-    
     const geom=new THREE.BufferGeometry();
     geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
     geom.setIndex(faces);
     geom.computeVertexNormals();
-    
     const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});
     mesh=new THREE.Mesh(geom,mat);
-    
-    // Center and scale
     geom.computeBoundingBox();
     const box=geom.boundingBox;
     const center=new THREE.Vector3();
     box.getCenter(center);
     mesh.position.sub(center);
-    
     const maxDim=Math.max(box.max.x-box.min.x,box.max.y-box.min.y,box.max.z-box.min.z);
     const scale=60/maxDim;
     mesh.scale.set(scale,scale,scale);
-    
     scene.add(mesh);
-    
-    // Setup renderer
     const container=$('preview3d');
     container.innerHTML='';
     container.appendChild(renderer.domElement);
-    
-    // Animate
     let angle=0;
     function animate(){
         requestAnimationFrame(animate);
@@ -601,7 +620,17 @@ async function exportSTL(){
         const r=await fetch('/api/stl',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,mode,marker:markerType})
+            body:JSON.stringify({
+                lat,lon,
+                radius:+$('rad').value,
+                size:+$('size').value,
+                height:+$('ht').value,
+                lineWidth:+$('lw').value,
+                mode,
+                marker:markerType,
+                markerSize:+$('ms').value,
+                markerGap:+$('mg').value
+            })
         });
         if(!r.ok)throw new Error((await r.json()).error);
         const blob=await r.blob();
@@ -639,23 +668,26 @@ def api_geo():
 def api_preview():
     try:
         d=request.json
-        lat,lon,radius,size,height,mode=d['lat'],d['lon'],d['radius'],d['size'],d['height'],d['mode']
+        lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
+        mode=d['mode']
+        lw=d.get('lineWidth',1.2)
+        marker=d.get('marker','none')
+        marker_size=d.get('markerSize',12)
+        marker_gap=d.get('markerGap',2)
         
         if mode=='streets':
             gdf=fetch_streets(lat,lon,radius)
-            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,1.2)
+            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,marker_size,marker_gap)
             count=len(gdf)
         elif mode=='city':
-            mesh=create_city_mesh(lat,lon,radius,size,height,1.0,1.5)
+            mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
             count=len(fetch_buildings(lat,lon,radius))
-        else:  # terrain
+        else:
             mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
             count=80*80
         
-        # Convert to lists for JSON
         verts=mesh.vertices.flatten().tolist()
         faces=mesh.faces.flatten().tolist()
-        
         return jsonify({'vertices':verts,'faces':faces,'count':count})
     except Exception as e:
         return jsonify({'error':str(e)}),500
@@ -664,24 +696,20 @@ def api_preview():
 def api_stl():
     try:
         d=request.json
-        lat,lon,radius,size,height,mode=d['lat'],d['lon'],d['radius'],d['size'],d['height'],d['mode']
-        marker_type=d.get('marker','none')
+        lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
+        mode=d['mode']
+        lw=d.get('lineWidth',1.2)
+        marker=d.get('marker','none')
+        marker_size=d.get('markerSize',12)
+        marker_gap=d.get('markerGap',2)
         
         if mode=='streets':
             gdf=fetch_streets(lat,lon,radius)
-            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,1.2)
+            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,marker_size,marker_gap)
         elif mode=='city':
-            mesh=create_city_mesh(lat,lon,radius,size,height,1.0,1.5)
+            mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
         else:
             mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
-        
-        # Add marker if selected (streets mode only)
-        if mode=='streets' and marker_type!='none' and marker_type in MARKERS and MARKERS[marker_type]:
-            marker_poly=MARKERS[marker_type](size*0.15)
-            try:
-                marker_mesh=trimesh.creation.extrude_polygon(marker_poly,height)
-                mesh=trimesh.util.concatenate([mesh,marker_mesh])
-            except:pass
         
         mesh.fill_holes();mesh.fix_normals()
         buf=io.BytesIO();mesh.export(buf,file_type='stl');buf.seek(0)
@@ -690,9 +718,9 @@ def api_stl():
         return jsonify({'error':str(e)}),500
 
 @app.route('/api/health')
-def health():return jsonify({'status':'ok','version':'3.0','author':'SebGE'})
+def health():return jsonify({'status':'ok','version':'3.1','author':'SebGE'})
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',8080))
-    print(f"\n  🗺️  Map→STL v3.0 by SebGE\n  → http://localhost:{port}\n")
+    print(f"\n  🗺️  Map→STL v3.1 by SebGE\n  → http://localhost:{port}\n")
     app.run(host='0.0.0.0',port=port,debug=os.environ.get('DEBUG','false').lower()=='true')
