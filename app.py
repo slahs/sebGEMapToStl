@@ -16,6 +16,37 @@ import trimesh
 app=Flask(__name__)
 CORS(app)
 
+
+# --- FIX: normalize bbox input (lat/lon, bbox, lat-bbox) ---
+from copy import deepcopy
+from flask import request
+
+def _normalize_bbox_payload():
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return
+        # handle legacy 'lat-bbox'
+        if 'lat-bbox' in data and 'bbox' not in data:
+            data['bbox'] = data.pop('lat-bbox')
+        # auto-create bbox from lat/lon
+        if 'bbox' not in data and 'lat' in data and 'lon' in data:
+            size_km = float(data.get('size_km', 2.0))
+            delta = size_km / 111.0
+            data['bbox'] = {
+                'min_lat': float(data['lat']) - delta,
+                'min_lon': float(data['lon']) - delta,
+                'max_lat': float(data['lat']) + delta,
+                'max_lon': float(data['lon']) + delta,
+            }
+        request._cached_json = (data, data)
+    except Exception:
+        pass
+
+@app.before_request
+def _before_any_request():
+    _normalize_bbox_payload()
+# --- END FIX ---
 # ==================== 3MF EXPORT (PURE PYTHON) ====================
 # Trimesh doesn't ship a 3MF exporter by default. This creates a minimal 3MF container
 # that works in Bambu Studio / PrusaSlicer / OrcaSlicer.
