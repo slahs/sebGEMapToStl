@@ -1,5 +1,5 @@
 """
-Map-to-STL v2.3 - Bambu Lab Style
+Map-to-STL v2.4 - Bambu Lab Style
 Created by SebGE - https://makerworld.com/de/@SebGE
 Features: Street Maps + 3D City Models (Buildings!) + Markers
 """
@@ -15,6 +15,95 @@ import trimesh
 
 app=Flask(__name__)
 CORS(app)
+
+# ==================== 3MF EXPORT (PURE PYTHON) ====================
+# Trimesh doesn't ship a 3MF exporter by default. This creates a minimal 3MF container
+# that works in Bambu Studio / PrusaSlicer / OrcaSlicer.
+def export_3mf_bytes(objects, unit="millimeter"):
+    """Create a minimal 3MF file (bytes) from a list of (name, trimesh.Trimesh)."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    # Namespace
+    NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+    ET.register_namespace("", NS)
+
+    def f(v):
+        # keep it readable + stable
+        return format(float(v), ".6f").rstrip("0").rstrip(".") if isinstance(v, (int, float, np.floating)) else str(v)
+
+    # Root model XML
+    model = ET.Element(f"{{{NS}}}model", attrib={
+        "unit": unit,
+        "xml:lang": "en-US"
+    })
+
+    resources = ET.SubElement(model, f"{{{NS}}}resources")
+    build = ET.SubElement(model, f"{{{NS}}}build")
+
+    obj_id = 1
+    for name, mesh in objects:
+        if mesh is None:
+            continue
+        if hasattr(mesh, "copy"):
+            mesh = mesh.copy()
+        # ensure triangles
+        try:
+            mesh = mesh.triangulate()
+        except Exception:
+            pass
+        if mesh.vertices is None or mesh.faces is None:
+            continue
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            continue
+
+        obj = ET.SubElement(resources, f"{{{NS}}}object", attrib={
+            "id": str(obj_id),
+            "type": "model",
+            "name": str(name)[:128]
+        })
+        mesh_el = ET.SubElement(obj, f"{{{NS}}}mesh")
+        verts_el = ET.SubElement(mesh_el, f"{{{NS}}}vertices")
+        tris_el = ET.SubElement(mesh_el, f"{{{NS}}}triangles")
+
+        # vertices
+        for vx, vy, vz in mesh.vertices:
+            ET.SubElement(verts_el, f"{{{NS}}}vertex", attrib={
+                "x": f(vx), "y": f(vy), "z": f(vz)
+            })
+
+        # triangles
+        for a, b, c in mesh.faces:
+            ET.SubElement(tris_el, f"{{{NS}}}triangle", attrib={
+                "v1": str(int(a)), "v2": str(int(b)), "v3": str(int(c))
+            })
+
+        ET.SubElement(build, f"{{{NS}}}item", attrib={"objectid": str(obj_id)})
+        obj_id += 1
+
+    # Serialize model XML
+    model_bytes = ET.tostring(model, encoding="utf-8", xml_declaration=True)
+
+    # OPC container files
+    content_types = b'''<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>
+'''
+    rels = b'''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" Target="3D/3dmodel.model"/>
+</Relationships>
+'''
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("3D/3dmodel.model", model_bytes)
+    buf.seek(0)
+    return buf.getvalue()
 
 # ==================== MARKER SHAPES ====================
 
@@ -90,7 +179,7 @@ def geocode(q):
             if -90<=lat<=90 and -180<=lon<=180:return{'lat':lat,'lon':lon,'name':f'{lat},{lon}'}
     except:pass
     try:
-        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'MapToSTL/2.3'},timeout=10)
+        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'MapToSTL/2.4'},timeout=10)
         if r.status_code==200 and r.json():
             d=r.json()[0];return{'lat':float(d['lat']),'lon':float(d['lon']),'name':d.get('display_name',q)}
     except:pass
@@ -207,6 +296,95 @@ def fetch_buildings(lat, lon, radius):
         print(f"  ✗ Buildings error: {e}")
         return generate_demo_buildings(lat, lon, radius)
 
+
+def fetch_water(lat, lon, radius):
+    """Fetch water polygons from OpenStreetMap (best-effort).
+
+    Sources:
+      - natural=water
+      - waterway=riverbank
+      - landuse=reservoir
+      - natural=bay
+    Notes:
+      - Relations (multipolygons) are handled best-effort by polygonizing member ways.
+      - If nothing is found, returns an empty GeoDataFrame (not an error).
+    """
+    bbox = radius / 111000
+    q = f"""[out:json][timeout:60];
+    (
+      way[\"natural\"=\"water\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      way[\"waterway\"=\"riverbank\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      way[\"landuse\"=\"reservoir\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      way[\"natural\"=\"bay\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      relation[\"natural\"=\"water\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      relation[\"waterway\"=\"riverbank\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+      relation[\"landuse\"=\"reservoir\"]({{lat-bbox}},{{lon-bbox*1.5}},{{lat+bbox}},{{lon+bbox*1.5}});
+    );
+    out body;
+    >;
+    out skel qt;""".format(lat=lat, lon=lon, bbox=bbox)
+    try:
+        r = requests.post('https://overpass-api.de/api/interpreter', data={'data': q}, timeout=60)
+        if r.status_code != 200:
+            raise Exception(f"API {r.status_code}")
+        data = r.json()
+
+        nodes = {e['id']: (e['lon'], e['lat']) for e in data.get('elements', []) if e.get('type') == 'node'}
+
+        # Collect way geometries
+        way_geoms = {}
+        for e in data.get('elements', []):
+            if e.get('type') == 'way' and 'nodes' in e:
+                coords = [nodes[n] for n in e['nodes'] if n in nodes]
+                if len(coords) < 3:
+                    continue
+                way_geoms[e['id']] = LineString(coords)
+
+        polys = []
+
+        # Closed ways -> polygon
+        for wid, ls in way_geoms.items():
+            try:
+                coords = list(ls.coords)
+                if len(coords) >= 4 and coords[0] == coords[-1]:
+                    p = Polygon(coords)
+                    if p.is_valid and (not p.is_empty) and p.area > 0:
+                        polys.append(p)
+            except:
+                continue
+
+        # Relations (multipolygon) best-effort: polygonize member ways
+        from shapely.ops import polygonize, unary_union
+        for e in data.get('elements', []):
+            if e.get('type') == 'relation':
+                try:
+                    members = e.get('members', [])
+                    lines = []
+                    for mem in members:
+                        if mem.get('type') == 'way':
+                            wid = mem.get('ref')
+                            if wid in way_geoms:
+                                lines.append(way_geoms[wid])
+                    if not lines:
+                        continue
+                    merged = unary_union(lines)
+                    rel_polys = [p for p in polygonize(merged) if (not p.is_empty and p.area > 0)]
+                    if rel_polys:
+                        rel_polys.sort(key=lambda p: p.area, reverse=True)
+                        polys.extend(rel_polys[:5])
+                except:
+                    continue
+
+        if not polys:
+            return gpd.GeoDataFrame(geometry=[], crs='EPSG:4326')
+
+        gdf = gpd.GeoDataFrame(geometry=polys, crs='EPSG:4326')
+        print(f"  ✓ {len(gdf)} water polys")
+        return gdf
+    except Exception as e:
+        print(f"  ✗ Water: {e}")
+        return gpd.GeoDataFrame(geometry=[], crs='EPSG:4326')
+
 def generate_demo_buildings(lat, lon, radius):
     """Generate demo buildings if API fails."""
     import random
@@ -314,6 +492,73 @@ def create_city_mesh(buildings, lat, lon, radius, size, height_scale=1.0, base_h
     combined.fix_normals()
     
     return combined
+
+
+def create_water_mesh(water_gdf, lat, lon, radius, size, water_height=1.0, z_offset=0.0):
+    """Create an extruded mesh from water polygons (best-effort)."""
+    try:
+        if water_gdf is None or getattr(water_gdf, "empty", True):
+            return None
+
+        center_proj = gpd.GeoDataFrame(geometry=gpd.points_from_xy([lon], [lat]), crs='EPSG:4326')
+        utm_crs = center_proj.estimate_utm_crs()
+        center_utm = center_proj.to_crs(utm_crs).geometry.iloc[0]
+
+        # project to UTM
+        wp = water_gdf.to_crs(utm_crs)
+
+        scale_factor = size / (2 * radius)
+        bounds = box(-size/2, -size/2, size/2, size/2)
+
+        meshes = []
+        for geom in wp.geometry:
+            try:
+                if geom is None or geom.is_empty:
+                    continue
+                if geom.geom_type == 'Polygon':
+                    geoms = [geom]
+                elif geom.geom_type == 'MultiPolygon':
+                    geoms = list(geom.geoms)
+                else:
+                    continue
+
+                for g in geoms:
+                    if g.is_empty or g.area < 1.0:
+                        continue
+                    coords = np.array(g.exterior.coords)
+                    coords[:, 0] = (coords[:, 0] - center_utm.x) * scale_factor
+                    coords[:, 1] = (coords[:, 1] - center_utm.y) * scale_factor
+                    norm_poly = Polygon(coords)
+
+                    clipped = norm_poly.intersection(bounds)
+                    if clipped.is_empty:
+                        continue
+
+                    polys_to_extrude = [clipped] if clipped.geom_type == 'Polygon' else list(clipped.geoms) if clipped.geom_type == 'MultiPolygon' else []
+                    for poly in polys_to_extrude:
+                        if poly.is_empty or poly.area < 0.5:
+                            continue
+                        try:
+                            m = trimesh.creation.extrude_polygon(poly, float(water_height))
+                            if m is None or len(m.vertices) == 0:
+                                continue
+                            if z_offset:
+                                m.vertices[:, 2] += float(z_offset)
+                            meshes.append(m)
+                        except:
+                            continue
+            except:
+                continue
+
+        if not meshes:
+            return None
+        combined = trimesh.util.concatenate(meshes)
+        combined.fill_holes()
+        combined.fix_normals()
+        return combined
+    except:
+        return None
+
 
 def create_city_preview_svg(buildings, lat, lon, radius, size):
     """Create SVG preview of city buildings."""
@@ -533,7 +778,27 @@ def gen_stl_separate(gdf,lat,lon,radius,lw,size,height,marker_type='none',marker
 
 # ==================== HTML TEMPLATE ====================
 
-HTML='''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Map to STL Generator | by SebGE</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/><style>:root{--b:#00AE42;--bd:#009639;--bg:#0d0d0d;--c:#1a1a1a;--i:#252525;--br:#333;--t:#fafafa;--d:#888}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.app{display:grid;grid-template-columns:440px 1fr 320px;min-height:100vh}.sb{background:var(--c);border-right:1px solid var(--br);padding:16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto}.hd{display:flex;align-items:center;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--br)}.logo{width:44px;height:44px;background:linear-gradient(135deg,var(--b),var(--bd));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px}.hd h1{font-size:18px;font-weight:700}.hd .sub{font-size:10px;color:var(--b);font-weight:500}.cr{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(0,174,66,.15),rgba(0,174,66,.05));border:1px solid var(--b);border-radius:10px;padding:12px 14px;text-decoration:none;transition:all .2s}.cr:hover{background:rgba(0,174,66,.2);transform:translateY(-2px);box-shadow:0 4px 15px rgba(0,174,66,.3)}.cr-av{width:40px;height:40px;background:linear-gradient(135deg,var(--b),var(--bd));border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff}.cr-i{flex:1}.cr-n{font-size:13px;font-weight:700}.cr-l{font-size:11px;color:var(--b);margin-top:2px}.cr-bd{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.cr-tag{font-size:8px;background:var(--b);color:#fff;padding:3px 8px;border-radius:4px;font-weight:700}.cr-mw{font-size:9px;color:var(--d)}.sw{position:relative}.si{width:100%;padding:12px 14px 12px 40px;background:var(--i);border:1px solid var(--br);border-radius:8px;color:var(--t);font-size:13px}.si:focus{outline:none;border-color:var(--b)}.sic{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--d)}.sbt{position:absolute;right:6px;top:50%;transform:translateY(-50%);padding:6px 14px;background:var(--b);border:none;border-radius:6px;color:#fff;font-size:11px;font-weight:600;cursor:pointer}.sbt:hover{background:var(--bd)}.cds{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.cd{background:var(--i);border:1px solid var(--br);border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px}.cd label{display:block;font-size:8px;color:var(--d);text-transform:uppercase;margin-bottom:2px;font-family:sans-serif}.cd span{color:var(--b);font-weight:500}.sec{background:var(--i);border:1px solid var(--br);border-radius:10px;padding:14px}.st{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--b);margin-bottom:12px;display:flex;align-items:center;gap:8px}.st::before{content:"";width:4px;height:14px;background:var(--b);border-radius:2px}.mode-tabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:12px}.mode-tab{padding:10px 6px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center;transition:all .15s}.mode-tab:hover{border-color:var(--b)}.mode-tab.a{border-color:var(--b);background:rgba(0,174,66,.15)}.mode-tab .ic{font-size:20px;margin-bottom:2px}.mode-tab .nm{font-size:10px;font-weight:600}.mode-tab .ds{font-size:8px;color:var(--d);margin-top:2px}.prs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}.pr{padding:6px 10px;background:var(--c);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:10px;cursor:pointer;font-weight:500}.pr:hover{border-color:var(--b);color:var(--b)}.pr.a{background:var(--b);border-color:var(--b);color:#fff}.tps{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.tp{display:flex;align-items:center;gap:5px;padding:6px 8px;background:var(--c);border:1px solid var(--br);border-radius:6px;cursor:pointer;font-size:10px}.tp:hover{border-color:var(--b)}.tp.a{border-color:var(--b);background:rgba(0,174,66,.1)}.tp .ck{width:12px;height:12px;border:2px solid var(--br);border-radius:3px;font-size:8px;display:flex;align-items:center;justify-content:center}.tp.a .ck{background:var(--b);border-color:var(--b);color:#fff}.stl{display:grid;grid-template-columns:repeat(5,1fr);gap:5px}.sty{padding:10px 6px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center}.sty:hover{border-color:var(--b)}.sty.a{border-color:var(--b);background:rgba(0,174,66,.1)}.sty .ic{font-size:20px}.sty .nm{font-size:9px;margin-top:4px;font-weight:500}.markers{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}.marker{padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center;transition:all .15s}.marker:hover{border-color:var(--b)}.marker.a{border-color:var(--b);background:rgba(0,174,66,.1)}.marker .ic{font-size:18px}.marker .nm{font-size:8px;margin-top:2px;font-weight:500}.cls{display:flex;gap:10px;margin-top:10px}.clp{display:flex;align-items:center;gap:6px;flex:1}.clp label{font-size:10px;color:var(--d);font-weight:500}.clp input[type="color"]{width:32px;height:24px;border:none;border-radius:4px;cursor:pointer;background:none}.cld{width:18px;height:18px;border-radius:4px;cursor:pointer;border:2px solid transparent}.cld:hover{transform:scale(1.15)}.pm{margin-bottom:10px}.pmh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}.pml{font-size:11px;font-weight:500}.pmv{font-family:monospace;font-size:10px;color:var(--b);background:var(--c);padding:3px 8px;border-radius:4px;font-weight:600}input[type="range"]{width:100%;height:6px;background:var(--c);border-radius:3px;-webkit-appearance:none;margin-top:2px}input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;background:var(--b);border-radius:50%;cursor:pointer}.ex{margin-top:auto;padding-top:14px;border-top:1px solid var(--br)}.bts{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px}.btn{padding:12px;border:none;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}.bp{background:linear-gradient(135deg,var(--b),var(--bd));color:#fff;box-shadow:0 4px 12px rgba(0,174,66,.3)}.bp:hover{transform:translateY(-2px)}.bs{background:var(--i);color:var(--t);border:1px solid var(--br)}.bs:hover{border-color:var(--b);color:var(--b)}.btn:disabled{opacity:.5;cursor:not-allowed}.sp{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.sts{padding:10px;border-radius:6px;font-size:11px;margin-top:8px;display:none;font-weight:500}.sts.er{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}.sts.ok{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--b)}.mw{position:relative}#map{width:100%;height:100%;background:var(--i)}.mi{position:absolute;top:12px;right:12px;background:rgba(26,26,26,.95);border:1px solid var(--br);border-radius:8px;padding:10px 14px;font-size:10px;color:var(--d);z-index:1000}.pv{background:var(--c);border-left:1px solid var(--br);padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}.pv h2{font-size:13px;font-weight:700}.bdg{font-size:9px;padding:3px 8px;background:var(--b);color:#fff;border-radius:6px;margin-left:auto;font-weight:600}.pvb{background:var(--i);border:1px solid var(--br);border-radius:12px;aspect-ratio:1;display:flex;align-items:center;justify-content:center;overflow:hidden}#pvs{width:100%;height:100%}.ph{color:var(--d);font-size:11px;text-align:center}.sts2{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.sta{background:var(--i);border:1px solid var(--br);border-radius:8px;padding:8px;text-align:center}.sta label{font-size:8px;color:var(--d);text-transform:uppercase}.sta .vl{font-family:monospace;font-size:12px;color:var(--b);margin-top:3px;font-weight:600}.inf{font-size:10px;color:var(--d);line-height:1.5;background:var(--i);border-radius:8px;padding:12px}.inf strong{color:var(--b)}.ft{margin-top:auto;padding-top:12px;border-top:1px solid var(--br);text-align:center;font-size:9px;color:var(--d)}.ft a{color:var(--b);text-decoration:none;font-weight:600}.ft a:hover{text-decoration:underline}.street-opts,.city-opts,.marker-opts{display:none}.street-opts.show,.city-opts.show,.marker-opts.show{display:block}.chk{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer}.chk input{display:none}.chk .box{width:18px;height:18px;border:2px solid var(--br);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all .15s}.chk input:checked+.box{background:var(--b);border-color:var(--b);color:#fff}.chk span{font-size:11px}@media(max-width:1300px){.app{grid-template-columns:420px 1fr}.pv{display:none}}@media(max-width:700px){.app{grid-template-columns:1fr;grid-template-rows:35vh auto}.sb{order:2}.mw{order:1}}</style></head><body><div class="app"><aside class="sb"><div class="hd"><div class="logo">🗺️</div><div><h1>Map → STL</h1><div class="sub">3D PRINT YOUR WORLD</div></div></div><a href="https://makerworld.com/de/@SebGE" target="_blank" class="cr"><div class="cr-av">S</div><div class="cr-i"><div class="cr-n">Created by SebGE</div><div class="cr-l">Check out my other models!</div></div><div class="cr-bd"><div class="cr-tag">✓ MAKER</div><div class="cr-mw">MakerWorld</div></div></a><div><div class="sw"><svg class="sic" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="loc" class="si" placeholder="Search city, address..." value="Düsseldorf"><button class="sbt" onclick="search()">Search</button></div><div class="cds"><div class="cd"><label>Lat</label><span id="lv">51.2277</span></div><div class="cd"><label>Lon</label><span id="lov">6.7735</span></div></div></div><div class="sec"><div class="st">Map Mode</div><div class="mode-tabs"><div class="mode-tab a" data-mode="streets" onclick="setMode('streets')"><div class="ic">🛣️</div><div class="nm">Streets</div><div class="ds">Roads & paths</div></div><div class="mode-tab" data-mode="city" onclick="setMode('city')"><div class="ic">🏙️</div><div class="nm">3D City</div><div class="ds">Buildings!</div></div><div class="mode-tab" data-mode="combined" onclick="setMode('combined')"><div class="ic">🌆</div><div class="nm">Combined</div><div class="ds">Both</div></div></div></div><div class="sec street-opts show"><div class="st">Center Marker</div><div class="markers"><div class="marker a" data-m="none" onclick="setMarker('none')"><div class="ic">❌</div><div class="nm">None</div></div><div class="marker" data-m="heart" onclick="setMarker('heart')"><div class="ic">❤️</div><div class="nm">Heart</div></div><div class="marker" data-m="star" onclick="setMarker('star')"><div class="ic">⭐</div><div class="nm">Star</div></div><div class="marker" data-m="pin" onclick="setMarker('pin')"><div class="ic">📍</div><div class="nm">Pin</div></div><div class="marker" data-m="house" onclick="setMarker('house')"><div class="ic">🏠</div><div class="nm">House</div></div><div class="marker" data-m="cross" onclick="setMarker('cross')"><div class="ic">✚</div><div class="nm">Cross</div></div><div class="marker" data-m="circle" onclick="setMarker('circle')"><div class="ic">⭕</div><div class="nm">Circle</div></div><div class="marker" data-m="diamond" onclick="setMarker('diamond')"><div class="ic">💎</div><div class="nm">Diamond</div></div></div><div class="marker-opts show"><div class="pm" style="margin-top:10px"><div class="pmh"><span class="pml">Marker Size</span><span class="pmv" id="msv">12mm</span></div><input type="range" id="ms" min="5" max="30" value="12" step="1" oninput="$('msv').textContent=this.value+'mm'"></div><div class="pm"><div class="pmh"><span class="pml">Gap (multi-color)</span><span class="pmv" id="mgv">2mm</span></div><input type="range" id="mg" min="0" max="5" value="2" step="0.5" oninput="$('mgv').textContent=this.value+'mm'"></div><label class="chk"><input type="checkbox" id="sep" checked><span class="box">✓</span><span>Export marker separately</span></label></div></div><div class="sec street-opts show"><div class="st">Street Types</div><div class="prs"><button class="pr a" onclick="preset('city')">🏙️ City</button><button class="pr" onclick="preset('rural')">🌾 Rural</button><button class="pr" onclick="preset('all')">📍 All</button><button class="pr" onclick="preset('main')">🛣️ Main</button></div><div class="tps" id="tps"><label class="tp a" data-t="motorway"><span class="ck">✓</span>🚀 Hwy</label><label class="tp a" data-t="trunk"><span class="ck">✓</span>🛣️ Trunk</label><label class="tp a" data-t="primary"><span class="ck">✓</span>🔴 Primary</label><label class="tp a" data-t="secondary"><span class="ck">✓</span>🟠 Second.</label><label class="tp a" data-t="tertiary"><span class="ck">✓</span>🟡 Tertiary</label><label class="tp a" data-t="residential"><span class="ck">✓</span>🏠 Resid.</label><label class="tp" data-t="service"><span class="ck">✓</span>🅿️ Service</label><label class="tp" data-t="footway"><span class="ck">✓</span>🚶 Foot</label><label class="tp" data-t="cycleway"><span class="ck">✓</span>🚴 Cycle</label></div></div><div class="sec street-opts show"><div class="st">Style & Colors</div><div class="stl"><div class="sty a" data-s="lines" onclick="setStyle('lines')"><div class="ic">〰️</div><div class="nm">Lines</div></div><div class="sty" data-s="filled" onclick="setStyle('filled')"><div class="ic">⬛</div><div class="nm">Filled</div></div><div class="sty" data-s="negative" onclick="setStyle('negative')"><div class="ic">🔲</div><div class="nm">Negative</div></div><div class="sty" data-s="outline" onclick="setStyle('outline')"><div class="ic">⭕</div><div class="nm">Circle</div></div><div class="sty" data-s="transparent" onclick="setStyle('transparent')"><div class="ic">🔳</div><div class="nm">Trans</div></div></div><div class="cls"><div class="clp"><label>Color:</label><input type="color" id="fg" value="#00AE42"><div class="cld" style="background:#00AE42" onclick="$('fg').value='#00AE42'"></div><div class="cld" style="background:#fff" onclick="$('fg').value='#ffffff'"></div></div><div class="clp"><label>BG:</label><input type="color" id="bg" value="#1a1a1a"><div class="cld" style="background:#1a1a1a" onclick="$('bg').value='#1a1a1a'"></div><div class="cld" style="background:#fff" onclick="$('bg').value='#ffffff'"></div></div></div></div><div class="sec city-opts"><div class="st">3D City Settings</div><div class="pm"><div class="pmh"><span class="pml">Building Height Scale</span><span class="pmv" id="bhsv">1.0x</span></div><input type="range" id="bhs" min="0.5" max="3" value="1" step="0.1" oninput="$('bhsv').textContent=this.value+'x'"></div><div class="pm"><div class="pmh"><span class="pml">Base Plate Height</span><span class="pmv" id="bpv">1.5mm</span></div><input type="range" id="bph" min="0.5" max="5" value="1.5" step="0.5" oninput="$('bpv').textContent=this.value+'mm'"></div><label class="chk"><input type="checkbox" id="ground" checked><span class="box">✓</span><span>Include ground plate</span></label><div class="inf" style="margin-top:8px"><strong>💡 Tips:</strong><br>• Try "Manhattan" or "Times Square"<br>• Building heights from OpenStreetMap<br>• Scale up for dramatic skylines!</div></div><div class="sec"><div class="st">Parameters</div><div class="pm"><div class="pmh"><span class="pml">Radius</span><span class="pmv" id="rv">500m</span></div><input type="range" id="rad" min="100" max="5000" value="500" step="100" oninput="$('rv').textContent=this.value>=1000?(this.value/1000)+'km':this.value+'m';uc()"></div><div class="pm street-opts show"><div class="pmh"><span class="pml">Line Width</span><span class="pmv" id="lwv">1.2mm</span></div><input type="range" id="lw" min="0.3" max="4" value="1.2" step="0.1" oninput="$('lwv').textContent=parseFloat(this.value).toFixed(1)+'mm'"></div><div class="pm street-opts show"><div class="pmh"><span class="pml">Height</span><span class="pmv" id="hv">2.0mm</span></div><input type="range" id="ht" min="0.4" max="8" value="2.0" step="0.1" oninput="$('hv').textContent=parseFloat(this.value).toFixed(1)+'mm'"></div><div class="pm"><div class="pmh"><span class="pml">Model Size</span><span class="pmv" id="sv">80mm</span></div><input type="range" id="sz" min="20" max="300" value="80" step="5" oninput="$('sv').textContent=this.value+'mm';$('ssz').textContent=this.value+'mm'"></div></div><div class="ex"><div class="bts"><button class="btn bs" id="bp" onclick="preview()">👁 Preview</button><button class="btn bs street-opts show" id="bsv" onclick="expSVG()">📄 SVG</button><button class="btn bp" id="bst" onclick="expSTL()">⬇ STL</button></div><div class="sts" id="sts"></div></div><div class="ft">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a><br>Follow for more 3D printing tools!</div></aside><main class="mw"><div id="map"></div><div class="mi">🖱️ Click to set center</div></main><aside class="pv"><h2>Preview <span class="bdg" id="bdg" style="display:none">Ready</span></h2><div class="pvb"><div id="pvs"></div><div class="ph" id="ph">👁 Click Preview</div></div><div class="sts2"><div class="sta"><label>Data</label><div class="vl" id="sseg">—</div></div><div class="sta"><label>Size</label><div class="vl" id="ssz">80mm</div></div><div class="sta"><label>Mode</label><div class="vl" id="smd">Streets</div></div></div><div class="inf"><strong>🏙️ 3D City Mode:</strong><br>• Real building footprints from OSM<br>• Heights from tags or estimated<br>• Perfect for skyline models!</div></aside></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>const $=id=>document.getElementById(id);let map,mk,cc,lat=51.2277,lon=6.7735,sty='lines',mode='streets',marker='none';const prs={city:['motorway','trunk','primary','secondary','tertiary','residential'],rural:['primary','secondary','tertiary','residential','track','service'],all:['motorway','trunk','primary','secondary','tertiary','residential','service','footway','cycleway'],main:['motorway','trunk','primary','secondary']};function init(){map=L.map('map').setView([lat,lon],14);L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);um();map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;um();uco()});document.querySelectorAll('.tp').forEach(el=>el.onclick=()=>{el.classList.toggle('a');document.querySelectorAll('.pr').forEach(p=>p.classList.remove('a'))});$('loc').onkeypress=e=>{if(e.key==='Enter')search()}}function setMode(m){mode=m;document.querySelectorAll('.mode-tab').forEach(el=>el.classList.toggle('a',el.dataset.mode===m));const showStreet=m==='streets'||m==='combined';const showCity=m==='city'||m==='combined';document.querySelectorAll('.street-opts').forEach(el=>el.classList.toggle('show',showStreet));document.querySelectorAll('.city-opts').forEach(el=>el.classList.toggle('show',showCity));$('smd').textContent=m==='streets'?'Streets':m==='city'?'3D City':'Combined'}function setMarker(m){marker=m;document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('a',el.dataset.m===m));document.querySelectorAll('.marker-opts').forEach(el=>el.classList.toggle('show',m!=='none'))}function preset(n){const t=prs[n]||[];document.querySelectorAll('.tp').forEach(el=>el.classList.toggle('a',t.includes(el.dataset.t)));document.querySelectorAll('.pr').forEach(p=>p.classList.toggle('a',p.textContent.toLowerCase().includes(n)))}function setStyle(s){sty=s;document.querySelectorAll('.sty').forEach(el=>el.classList.toggle('a',el.dataset.s===s))}function gt(){return Array.from(document.querySelectorAll('.tp.a')).map(e=>e.dataset.t)}function um(){const r=+$('rad').value;if(mk)map.removeLayer(mk);if(cc)map.removeLayer(cc);mk=L.marker([lat,lon],{icon:L.divIcon({html:'<div style="width:16px;height:16px;background:#00AE42;border:2px solid #fff;border-radius:50%;box-shadow:0 2px 8px rgba(0,174,66,.5)"></div>',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map);cc=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.08,weight:2,dashArray:'8,8'}).addTo(map)}function uc(){const r=+$('rad').value;if(cc)cc.setRadius(r)}function uco(){$('lv').textContent=lat.toFixed(5);$('lov').textContent=lon.toFixed(5)}function pm(){return{lat,lon,radius:+$('rad').value,line_width:+$('lw').value,extrusion_height:+$('ht').value,target_size:+$('sz').value,street_types:gt(),style:sty,bg_color:$('bg').value,line_color:$('fg').value,mode,marker_type:marker,marker_size:+$('ms').value,marker_gap:+$('mg').value,separate_marker:$('sep').checked,height_scale:+$('bhs').value,base_height:+$('bph').value,include_ground:$('ground').checked}}async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);um();uco();msg('ok','✓ '+(d.name||q).substring(0,40))}catch(e){msg('er',e.message)}}async function preview(){const btn=$('bp');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';$('bdg').textContent='...';$('bdg').style.display='inline';try{let endpoint='/api/preview';if(mode==='city')endpoint='/api/city-preview';else if(mode==='combined')endpoint='/api/combined-preview';const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pm())});const d=await r.json();if(d.error)throw new Error(d.error);$('ph').style.display='none';$('pvs').innerHTML=d.svg;$('sseg').textContent=d.stats?.segments||d.stats?.buildings||'—';$('bdg').textContent='Ready';msg('ok','✓ Preview loaded')}catch(e){msg('er',e.message);$('bdg').style.display='none'}finally{btn.disabled=false;btn.innerHTML='👁 Preview'}}async function expSVG(){const btn=$('bsv');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';try{const r=await fetch('/api/svg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pm())});if(!r.ok)throw new Error((await r.json()).error);dl(await r.blob(),`map_${lat.toFixed(4)}_${lon.toFixed(4)}.svg`);msg('ok','✓ SVG')}catch(e){msg('er',e.message)}finally{btn.disabled=false;btn.innerHTML='📄 SVG'}}async function expSTL(){const btn=$('bst');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';try{const p=pm();let endpoint='/api/stl';if(mode==='city')endpoint='/api/city-stl';else if(mode==='combined')endpoint='/api/combined-stl';else if(p.separate_marker&&p.marker_type!=='none')endpoint='/api/stl-separate';const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});if(!r.ok)throw new Error((await r.json()).error);const ct=r.headers.get('content-type');const ext=ct&&ct.includes('zip')?'zip':'stl';dl(await r.blob(),`map_${lat.toFixed(4)}_${lon.toFixed(4)}_${mode}.${ext}`);msg('ok','✓ STL created!')}catch(e){msg('er',e.message)}finally{btn.disabled=false;btn.innerHTML='⬇ STL'}}function dl(b,n){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;a.click();URL.revokeObjectURL(a.href)}function msg(t,m){const el=$('sts');el.className='sts '+t;el.textContent=m;setTimeout(()=>el.className='sts',5000)}document.addEventListener('DOMContentLoaded',init)</script></body></html>'''
+HTML='''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Map to STL Generator | by SebGE</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/><style>:root{--b:#00AE42;--bd:#009639;--bg:#0d0d0d;--c:#1a1a1a;--i:#252525;--br:#333;--t:#fafafa;--d:#888}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}.app{display:grid;grid-template-columns:440px 1fr 320px;min-height:100vh}.sb{background:var(--c);border-right:1px solid var(--br);padding:16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto}.hd{display:flex;align-items:center;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--br)}.logo{width:44px;height:44px;background:linear-gradient(135deg,var(--b),var(--bd));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px}.hd h1{font-size:18px;font-weight:700}.hd .sub{font-size:10px;color:var(--b);font-weight:500}.cr{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(0,174,66,.15),rgba(0,174,66,.05));border:1px solid var(--b);border-radius:10px;padding:12px 14px;text-decoration:none;transition:all .2s}.cr:hover{background:rgba(0,174,66,.2);transform:translateY(-2px);box-shadow:0 4px 15px rgba(0,174,66,.3)}.cr-av{width:40px;height:40px;background:linear-gradient(135deg,var(--b),var(--bd));border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff}.cr-i{flex:1}.cr-n{font-size:13px;font-weight:700}.cr-l{font-size:11px;color:var(--b);margin-top:2px}.cr-bd{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.cr-tag{font-size:8px;background:var(--b);color:#fff;padding:3px 8px;border-radius:4px;font-weight:700}.cr-mw{font-size:9px;color:var(--d)}.sw{position:relative}.si{width:100%;padding:12px 14px 12px 40px;background:var(--i);border:1px solid var(--br);border-radius:8px;color:var(--t);font-size:13px}.si:focus{outline:none;border-color:var(--b)}.sic{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--d)}.sbt{position:absolute;right:6px;top:50%;transform:translateY(-50%);padding:6px 14px;background:var(--b);border:none;border-radius:6px;color:#fff;font-size:11px;font-weight:600;cursor:pointer}.sbt:hover{background:var(--bd)}.cds{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.cd{background:var(--i);border:1px solid var(--br);border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px}.cd label{display:block;font-size:8px;color:var(--d);text-transform:uppercase;margin-bottom:2px;font-family:sans-serif}.cd span{color:var(--b);font-weight:500}.sec{background:var(--i);border:1px solid var(--br);border-radius:10px;padding:14px}.st{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--b);margin-bottom:12px;display:flex;align-items:center;gap:8px}.st::before{content:"";width:4px;height:14px;background:var(--b);border-radius:2px}.mode-tabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:12px}.mode-tab{padding:10px 6px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center;transition:all .15s}.mode-tab:hover{border-color:var(--b)}.mode-tab.a{border-color:var(--b);background:rgba(0,174,66,.15)}.mode-tab .ic{font-size:20px;margin-bottom:2px}.mode-tab .nm{font-size:10px;font-weight:600}.mode-tab .ds{font-size:8px;color:var(--d);margin-top:2px}.prs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}.pr{padding:6px 10px;background:var(--c);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:10px;cursor:pointer;font-weight:500}.pr:hover{border-color:var(--b);color:var(--b)}.pr.a{background:var(--b);border-color:var(--b);color:#fff}.tps{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.tp{display:flex;align-items:center;gap:5px;padding:6px 8px;background:var(--c);border:1px solid var(--br);border-radius:6px;cursor:pointer;font-size:10px}.tp:hover{border-color:var(--b)}.tp.a{border-color:var(--b);background:rgba(0,174,66,.1)}.tp .ck{width:12px;height:12px;border:2px solid var(--br);border-radius:3px;font-size:8px;display:flex;align-items:center;justify-content:center}.tp.a .ck{background:var(--b);border-color:var(--b);color:#fff}.stl{display:grid;grid-template-columns:repeat(5,1fr);gap:5px}.sty{padding:10px 6px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center}.sty:hover{border-color:var(--b)}.sty.a{border-color:var(--b);background:rgba(0,174,66,.1)}.sty .ic{font-size:20px}.sty .nm{font-size:9px;margin-top:4px;font-weight:500}.markers{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}.marker{padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:8px;cursor:pointer;text-align:center;transition:all .15s}.marker:hover{border-color:var(--b)}.marker.a{border-color:var(--b);background:rgba(0,174,66,.1)}.marker .ic{font-size:18px}.marker .nm{font-size:8px;margin-top:2px;font-weight:500}.cls{display:flex;gap:10px;margin-top:10px}.clp{display:flex;align-items:center;gap:6px;flex:1}.clp label{font-size:10px;color:var(--d);font-weight:500}.clp input[type="color"]{width:32px;height:24px;border:none;border-radius:4px;cursor:pointer;background:none}.cld{width:18px;height:18px;border-radius:4px;cursor:pointer;border:2px solid transparent}.cld:hover{transform:scale(1.15)}.pm{margin-bottom:10px}.pmh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}.pml{font-size:11px;font-weight:500}.pmv{font-family:monospace;font-size:10px;color:var(--b);background:var(--c);padding:3px 8px;border-radius:4px;font-weight:600}input[type="range"]{width:100%;height:6px;background:var(--c);border-radius:3px;-webkit-appearance:none;margin-top:2px}input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;background:var(--b);border-radius:50%;cursor:pointer}.ex{margin-top:auto;padding-top:14px;border-top:1px solid var(--br)}.bts{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px}.btn{padding:12px;border:none;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}.bp{background:linear-gradient(135deg,var(--b),var(--bd));color:#fff;box-shadow:0 4px 12px rgba(0,174,66,.3)}.bp:hover{transform:translateY(-2px)}.bs{background:var(--i);color:var(--t);border:1px solid var(--br)}.bs:hover{border-color:var(--b);color:var(--b)}.btn:disabled{opacity:.5;cursor:not-allowed}.sp{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.sts{padding:10px;border-radius:6px;font-size:11px;margin-top:8px;display:none;font-weight:500}.sts.er{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}.sts.ok{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--b)}.mw{position:relative}#map{width:100%;height:100%;background:var(--i)}.mi{position:absolute;top:12px;right:12px;background:rgba(26,26,26,.95);border:1px solid var(--br);border-radius:8px;padding:10px 14px;font-size:10px;color:var(--d);z-index:1000}.pv{background:var(--c);border-left:1px solid var(--br);padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}.pv h2{font-size:13px;font-weight:700}.bdg{font-size:9px;padding:3px 8px;background:var(--b);color:#fff;border-radius:6px;margin-left:auto;font-weight:600}.pvb{background:var(--i);border:1px solid var(--br);border-radius:12px;aspect-ratio:1;display:flex;align-items:center;justify-content:center;overflow:hidden}#pvs{width:100%;height:100%}.ph{color:var(--d);font-size:11px;text-align:center}.sts2{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}.sta{background:var(--i);border:1px solid var(--br);border-radius:8px;padding:8px;text-align:center}.sta label{font-size:8px;color:var(--d);text-transform:uppercase}.sta .vl{font-family:monospace;font-size:12px;color:var(--b);margin-top:3px;font-weight:600}.inf{font-size:10px;color:var(--d);line-height:1.5;background:var(--i);border-radius:8px;padding:12px}.inf strong{color:var(--b)}.ft{margin-top:auto;padding-top:12px;border-top:1px solid var(--br);text-align:center;font-size:9px;color:var(--d)}.ft a{color:var(--b);text-decoration:none;font-weight:600}.ft a:hover{text-decoration:underline}.street-opts,.city-opts,.marker-opts{display:none}.street-opts.show,.city-opts.show,.marker-opts.show{display:block}.chk{display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer}.chk input{display:none}.chk .box{width:18px;height:18px;border:2px solid var(--br);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;transition:all .15s}.chk input:checked+.box{background:var(--b);border-color:var(--b);color:#fff}.chk span{font-size:11px}@media(max-width:1300px){.app{grid-template-columns:420px 1fr}.pv{display:none}}@media(max-width:700px){.app{grid-template-columns:1fr;grid-template-rows:35vh auto}.sb{order:2}.mw{order:1}}</style></head><body><div class="app"><aside class="sb"><div class="hd"><div class="logo">🗺️</div><div><h1>Map → STL</h1><div class="sub">3D PRINT YOUR WORLD</div></div></div><a href="https://makerworld.com/de/@SebGE" target="_blank" class="cr"><div class="cr-av">S</div><div class="cr-i"><div class="cr-n">Created by SebGE</div><div class="cr-l">Check out my other models!</div></div><div class="cr-bd"><div class="cr-tag">✓ MAKER</div><div class="cr-mw">MakerWorld</div></div></a><div><div class="sw"><svg class="sic" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="loc" class="si" placeholder="Search city, address..." value="Düsseldorf"><button class="sbt" onclick="search()">Search</button></div><div class="cds"><div class="cd"><label>Lat</label><span id="lv">51.2277</span></div><div class="cd"><label>Lon</label><span id="lov">6.7735</span></div></div></div><div class="sec"><div class="st">Map Mode</div><div class="mode-tabs"><div class="mode-tab a" data-mode="streets" onclick="setMode('streets')"><div class="ic">🛣️</div><div class="nm">Streets</div><div class="ds">Roads & paths</div></div><div class="mode-tab" data-mode="city" onclick="setMode('city')"><div class="ic">🏙️</div><div class="nm">3D City</div><div class="ds">Buildings!</div></div><div class="mode-tab" data-mode="combined" onclick="setMode('combined')"><div class="ic">🌆</div><div class="nm">Combined</div><div class="ds">Both</div></div></div></div><div class="sec street-opts show"><div class="st">Center Marker</div><div class="markers"><div class="marker a" data-m="none" onclick="setMarker('none')"><div class="ic">❌</div><div class="nm">None</div></div><div class="marker" data-m="heart" onclick="setMarker('heart')"><div class="ic">❤️</div><div class="nm">Heart</div></div><div class="marker" data-m="star" onclick="setMarker('star')"><div class="ic">⭐</div><div class="nm">Star</div></div><div class="marker" data-m="pin" onclick="setMarker('pin')"><div class="ic">📍</div><div class="nm">Pin</div></div><div class="marker" data-m="house" onclick="setMarker('house')"><div class="ic">🏠</div><div class="nm">House</div></div><div class="marker" data-m="cross" onclick="setMarker('cross')"><div class="ic">✚</div><div class="nm">Cross</div></div><div class="marker" data-m="circle" onclick="setMarker('circle')"><div class="ic">⭕</div><div class="nm">Circle</div></div><div class="marker" data-m="diamond" onclick="setMarker('diamond')"><div class="ic">💎</div><div class="nm">Diamond</div></div></div><div class="marker-opts show"><div class="pm" style="margin-top:10px"><div class="pmh"><span class="pml">Marker Size</span><span class="pmv" id="msv">12mm</span></div><input type="range" id="ms" min="5" max="30" value="12" step="1" oninput="$('msv').textContent=this.value+'mm'"></div><div class="pm"><div class="pmh"><span class="pml">Gap (multi-color)</span><span class="pmv" id="mgv">2mm</span></div><input type="range" id="mg" min="0" max="5" value="2" step="0.5" oninput="$('mgv').textContent=this.value+'mm'"></div><label class="chk"><input type="checkbox" id="sep" checked><span class="box">✓</span><span>Export marker separately</span></label></div></div><div class="sec street-opts show"><div class="st">Street Types</div><div class="prs"><button class="pr a" onclick="preset('city')">🏙️ City</button><button class="pr" onclick="preset('rural')">🌾 Rural</button><button class="pr" onclick="preset('all')">📍 All</button><button class="pr" onclick="preset('main')">🛣️ Main</button></div><div class="tps" id="tps"><label class="tp a" data-t="motorway"><span class="ck">✓</span>🚀 Hwy</label><label class="tp a" data-t="trunk"><span class="ck">✓</span>🛣️ Trunk</label><label class="tp a" data-t="primary"><span class="ck">✓</span>🔴 Primary</label><label class="tp a" data-t="secondary"><span class="ck">✓</span>🟠 Second.</label><label class="tp a" data-t="tertiary"><span class="ck">✓</span>🟡 Tertiary</label><label class="tp a" data-t="residential"><span class="ck">✓</span>🏠 Resid.</label><label class="tp" data-t="service"><span class="ck">✓</span>🅿️ Service</label><label class="tp" data-t="footway"><span class="ck">✓</span>🚶 Foot</label><label class="tp" data-t="cycleway"><span class="ck">✓</span>🚴 Cycle</label></div></div><div class="sec street-opts show"><div class="st">Style & Colors</div><div class="stl"><div class="sty a" data-s="lines" onclick="setStyle('lines')"><div class="ic">〰️</div><div class="nm">Lines</div></div><div class="sty" data-s="filled" onclick="setStyle('filled')"><div class="ic">⬛</div><div class="nm">Filled</div></div><div class="sty" data-s="negative" onclick="setStyle('negative')"><div class="ic">🔲</div><div class="nm">Negative</div></div><div class="sty" data-s="outline" onclick="setStyle('outline')"><div class="ic">⭕</div><div class="nm">Circle</div></div><div class="sty" data-s="transparent" onclick="setStyle('transparent')"><div class="ic">🔳</div><div class="nm">Trans</div></div></div><div class="cls"><div class="clp"><label>Color:</label><input type="color" id="fg" value="#00AE42"><div class="cld" style="background:#00AE42" onclick="$('fg').value='#00AE42'"></div><div class="cld" style="background:#fff" onclick="$('fg').value='#ffffff'"></div></div><div class="clp"><label>BG:</label><input type="color" id="bg" value="#1a1a1a"><div class="cld" style="background:#1a1a1a" onclick="$('bg').value='#1a1a1a'"></div><div class="cld" style="background:#fff" onclick="$('bg').value='#ffffff'"></div></div></div></div><div class="sec city-opts"><div class="st">3D City Settings</div><div class="pm"><div class="pmh"><span class="pml">Building Height Scale</span><span class="pmv" id="bhsv">1.0x</span></div><input type="range" id="bhs" min="0.5" max="3" value="1" step="0.1" oninput="$('bhsv').textContent=this.value+'x'"></div><div class="pm"><div class="pmh"><span class="pml">Base Plate Height</span><span class="pmv" id="bpv">1.5mm</span></div><input type="range" id="bph" min="0.5" max="5" value="1.5" step="0.5" oninput="$('bpv').textContent=this.value+'mm'"></div><label class="chk"><input type="checkbox" id="ground" checked><span class="box">✓</span><span>Include ground plate</span></label><div class="inf" style="margin-top:8px"><strong>💡 Tips:</strong><br>• Try "Manhattan" or "Times Square"<br>• Building heights from OpenStreetMap<br>• Scale up for dramatic skylines!</div></div><div class="sec"><div class="st">Parameters</div><div class="pm"><div class="pmh"><span class="pml">Radius</span><span class="pmv" id="rv">500m</span></div><input type="range" id="rad" min="100" max="5000" value="500" step="100" oninput="$('rv').textContent=this.value>=1000?(this.value/1000)+'km':this.value+'m';uc()"></div><div class="pm street-opts show"><div class="pmh"><span class="pml">Line Width</span><span class="pmv" id="lwv">1.2mm</span></div><input type="range" id="lw" min="0.3" max="4" value="1.2" step="0.1" oninput="$('lwv').textContent=parseFloat(this.value).toFixed(1)+'mm'"></div><div class="pm street-opts show"><div class="pmh"><span class="pml">Height</span><span class="pmv" id="hv">2.0mm</span></div><input type="range" id="ht" min="0.4" max="8" value="2.0" step="0.1" oninput="$('hv').textContent=parseFloat(this.value).toFixed(1)+'mm'"></div>
+<label class="chk"><input type="checkbox" id="water" checked><span class="box">✓</span><span>Include water</span></label>
+<div class="pm"><div class="pmh"><span class="pml">Water Height</span><span class="pmv" id="whv">1.0mm</span></div><input type="range" id="wh" min="0.2" max="6" value="1.0" step="0.1" oninput="$('whv').textContent=parseFloat(this.value).toFixed(1)+'mm'"></div>
+<div class="pm"><div class="pmh"><span class="pml">Model Size</span><span class="pmv" id="sv">80mm</span></div><input type="range" id="sz" min="20" max="300" value="80" step="5" oninput="$('sv').textContent=this.value+'mm';$('ssz').textContent=this.value+'mm'"></div></div><div class="ex"><div class="bts"><button class="btn bs" id="bp" onclick="preview()">👁 Preview</button><button class="btn bs street-opts show" id="bsv" onclick="expSVG()">📄 SVG</button><button class="btn bs" id="b3" onclick="exp3MF()">🧩 3MF</button><button class="btn bp" id="bst" onclick="expSTL()">⬇ STL</button></div><div class="sts" id="sts"></div></div><div class="ft">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a><br>Follow for more 3D printing tools!</div></aside><main class="mw"><div id="map"></div><div class="mi">🖱️ Click to set center</div></main><aside class="pv"><h2>Preview <span class="bdg" id="bdg" style="display:none">Ready</span></h2><div class="pvb"><div id="pvs"></div><div class="ph" id="ph">👁 Click Preview</div></div><div class="sts2"><div class="sta"><label>Data</label><div class="vl" id="sseg">—</div></div><div class="sta"><label>Size</label><div class="vl" id="ssz">80mm</div></div><div class="sta"><label>Mode</label><div class="vl" id="smd">Streets</div></div></div><div class="inf"><strong>🏙️ 3D City Mode:</strong><br>• Real building footprints from OSM<br>• Heights from tags or estimated<br>• Perfect for skyline models!</div></aside></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>const $=id=>document.getElementById(id);let map,mk,cc,lat=51.2277,lon=6.7735,sty='lines',mode='streets',marker='none';const prs={city:['motorway','trunk','primary','secondary','tertiary','residential'],rural:['primary','secondary','tertiary','residential','track','service'],all:['motorway','trunk','primary','secondary','tertiary','residential','service','footway','cycleway'],main:['motorway','trunk','primary','secondary']};function init(){map=L.map('map').setView([lat,lon],14);L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);um();map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;um();uco()});document.querySelectorAll('.tp').forEach(el=>el.onclick=()=>{el.classList.toggle('a');document.querySelectorAll('.pr').forEach(p=>p.classList.remove('a'))});$('loc').onkeypress=e=>{if(e.key==='Enter')search()}}function setMode(m){mode=m;document.querySelectorAll('.mode-tab').forEach(el=>el.classList.toggle('a',el.dataset.mode===m));const showStreet=m==='streets'||m==='combined';const showCity=m==='city'||m==='combined';document.querySelectorAll('.street-opts').forEach(el=>el.classList.toggle('show',showStreet));document.querySelectorAll('.city-opts').forEach(el=>el.classList.toggle('show',showCity));$('smd').textContent=m==='streets'?'Streets':m==='city'?'3D City':'Combined'}function setMarker(m){marker=m;document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('a',el.dataset.m===m));document.querySelectorAll('.marker-opts').forEach(el=>el.classList.toggle('show',m!=='none'))}function preset(n){const t=prs[n]||[];document.querySelectorAll('.tp').forEach(el=>el.classList.toggle('a',t.includes(el.dataset.t)));document.querySelectorAll('.pr').forEach(p=>p.classList.toggle('a',p.textContent.toLowerCase().includes(n)))}function setStyle(s){sty=s;document.querySelectorAll('.sty').forEach(el=>el.classList.toggle('a',el.dataset.s===s))}function gt(){return Array.from(document.querySelectorAll('.tp.a')).map(e=>e.dataset.t)}function um(){const r=+$('rad').value;if(mk)map.removeLayer(mk);if(cc)map.removeLayer(cc);mk=L.marker([lat,lon],{icon:L.divIcon({html:'<div style="width:16px;height:16px;background:#00AE42;border:2px solid #fff;border-radius:50%;box-shadow:0 2px 8px rgba(0,174,66,.5)"></div>',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map);cc=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.08,weight:2,dashArray:'8,8'}).addTo(map)}function uc(){const r=+$('rad').value;if(cc)cc.setRadius(r)}function uco(){$('lv').textContent=lat.toFixed(5);$('lov').textContent=lon.toFixed(5)}function pm(){return{lat,lon,radius:+$('rad').value,line_width:+$('lw').value,extrusion_height:+$('ht').value,include_water:$('water').checked,water_height:+$('wh').value,target_size:+$('sz').value,street_types:gt(),style:sty,bg_color:$('bg').value,line_color:$('fg').value,mode,marker_type:marker,marker_size:+$('ms').value,marker_gap:+$('mg').value,separate_marker:$('sep').checked,height_scale:+$('bhs').value,base_height:+$('bph').value,include_ground:$('ground').checked}}async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);um();uco();msg('ok','✓ '+(d.name||q).substring(0,40))}catch(e){msg('er',e.message)}}async function preview(){const btn=$('bp');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';$('bdg').textContent='...';$('bdg').style.display='inline';try{let endpoint='/api/preview';if(mode==='city')endpoint='/api/city-preview';else if(mode==='combined')endpoint='/api/combined-preview';const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pm())});const d=await r.json();if(d.error)throw new Error(d.error);$('ph').style.display='none';$('pvs').innerHTML=d.svg;$('sseg').textContent=d.stats?.segments||d.stats?.buildings||'—';$('bdg').textContent='Ready';msg('ok','✓ Preview loaded')}catch(e){msg('er',e.message);$('bdg').style.display='none'}finally{btn.disabled=false;btn.innerHTML='👁 Preview'}}async function expSVG(){const btn=$('bsv');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';try{const r=await fetch('/api/svg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pm())});if(!r.ok)throw new Error((await r.json()).error);dl(await r.blob(),`map_${lat.toFixed(4)}_${lon.toFixed(4)}.svg`);msg('ok','✓ SVG')}catch(e){msg('er',e.message)}finally{btn.disabled=false;btn.innerHTML='📄 SVG'}}async function expSTL(){const btn=$('bst');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';try{const p=pm();let endpoint='/api/stl';if(mode==='city')endpoint='/api/city-stl';else if(mode==='combined')endpoint='/api/combined-stl';else if(p.separate_marker&&p.marker_type!=='none')endpoint='/api/stl-separate';const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});if(!r.ok)throw new Error((await r.json()).error);const ct=r.headers.get('content-type');const ext=ct&&ct.includes('zip')?'zip':'stl';dl(await r.blob(),`map_${lat.toFixed(4)}_${lon.toFixed(4)}_${mode}.${ext}`);msg('ok','✓ STL created!')}catch(e){msg('er',e.message)}finally{btn.disabled=false;btn.innerHTML='⬇ STL'}}
+async function exp3MF(){
+  const btn=$('b3');btn.disabled=true;btn.innerHTML='<div class="sp"></div>';
+  try{
+    const p=pm();
+    let endpoint='/api/3mf';
+    if(mode==='city') endpoint='/api/city-3mf';
+    else if(mode==='combined') endpoint='/api/combined-3mf';
+    else if(p.separate_marker&&p.marker_type!=='none') endpoint='/api/3mf-separate';
+    const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+    if(!r.ok) throw new Error((await r.json()).error);
+    dl(await r.blob(),`map_${lat.toFixed(4)}_${lon.toFixed(4)}_${mode}.3mf`);
+    msg('ok','✓ 3MF created!');
+  }catch(e){msg('er',e.message)}
+  finally{btn.disabled=false;btn.innerHTML='🧩 3MF'}
+}
+
+function dl(b,n){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;a.click();URL.revokeObjectURL(a.href)}function msg(t,m){const el=$('sts');el.className='sts '+t;el.textContent=m;setTimeout(()=>el.className='sts',5000)}document.addEventListener('DOMContentLoaded',init)</script></body></html>'''
 
 # ==================== API ROUTES ====================
 
@@ -638,10 +903,111 @@ def api_combined_stl():
         return send_file(zip_buf, mimetype='application/zip', as_attachment=True, download_name='city_combined.zip')
     except Exception as e:return jsonify({'error':str(e)}),500
 
+
+@app.route('/api/3mf',methods=['POST'])
+def api_3mf():
+    """Export streets (and optional water + marker) as a single 3MF with multiple objects."""
+    try:
+        d=request.json
+        gdf=fetch_streets(d['lat'],d['lon'],d['radius'],d.get('street_types'))
+        include_water = bool(d.get('include_water', True))
+        water_height = float(d.get('water_height', 1.0))
+
+        objects=[]
+        if d.get('marker_type','none')!='none' and d.get('separate_marker', False):
+            streets_mesh, marker_mesh = gen_stl_separate(
+                gdf,d['lat'],d['lon'],d['radius'],d['line_width'],d['target_size'],d['extrusion_height'],
+                d.get('marker_type','none'),d.get('marker_size',12),d.get('marker_gap',2)
+            )
+            if streets_mesh is not None: objects.append(('streets', streets_mesh))
+            if marker_mesh is not None: objects.append((f"marker_{d.get('marker_type','marker')}", marker_mesh))
+        else:
+            mesh=gen_stl(
+                gdf,d['lat'],d['lon'],d['radius'],d['line_width'],d['target_size'],d['extrusion_height'],
+                d.get('negative',False),d.get('marker_type','none'),d.get('marker_size',12),d.get('marker_gap',2)
+            )
+            objects.append(('streets', mesh))
+
+        if include_water:
+            water_gdf = fetch_water(d['lat'], d['lon'], d['radius'])
+            water_mesh = create_water_mesh(water_gdf, d['lat'], d['lon'], d['radius'], d.get('target_size',80), water_height, z_offset=0.0)
+            if water_mesh is not None:
+                objects.append(('water', water_mesh))
+
+        data = export_3mf_bytes(objects)
+        return send_file(io.BytesIO(data), mimetype='model/3mf', as_attachment=True, download_name='map.3mf')
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/3mf-separate',methods=['POST'])
+def api_3mf_sep():
+    """Legacy endpoint name from UI: always export streets+marker as separate objects in one 3MF."""
+    return api_3mf()
+
+@app.route('/api/city-3mf',methods=['POST'])
+def api_city_3mf():
+    """Export 3D city (and optional water) as a 3MF."""
+    try:
+        d=request.json
+        buildings=fetch_buildings(d['lat'],d['lon'],d['radius'])
+        base_h = float(d.get('base_height',1.5))
+        city_mesh=create_city_mesh(
+            buildings,d['lat'],d['lon'],d['radius'],d.get('target_size',80),
+            d.get('height_scale',1.0),base_h,d.get('include_ground',True)
+        )
+        objects=[('city', city_mesh)]
+
+        if bool(d.get('include_water', True)):
+            water_gdf = fetch_water(d['lat'], d['lon'], d['radius'])
+            water_mesh = create_water_mesh(water_gdf, d['lat'], d['lon'], d['radius'], d.get('target_size',80), float(d.get('water_height', 1.0)), z_offset=base_h)
+            if water_mesh is not None:
+                objects.append(('water', water_mesh))
+
+        data = export_3mf_bytes(objects)
+        return send_file(io.BytesIO(data), mimetype='model/3mf', as_attachment=True, download_name='city.3mf')
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/combined-3mf',methods=['POST'])
+def api_combined_3mf():
+    """Export city + streets (+ optional water) as one 3MF with separate objects."""
+    try:
+        d=request.json
+        base_h = float(d.get('base_height',1.5))
+
+        buildings=fetch_buildings(d['lat'],d['lon'],d['radius'])
+        city_mesh=create_city_mesh(
+            buildings,d['lat'],d['lon'],d['radius'],d.get('target_size',80),
+            d.get('height_scale',1.0),base_h,d.get('include_ground',True)
+        )
+
+        gdf=fetch_streets(d['lat'],d['lon'],d['radius'],d.get('street_types'))
+        streets_mesh=gen_stl(gdf,d['lat'],d['lon'],d['radius'],d['line_width'],d['target_size'],d['extrusion_height'],False,'none',0,0)
+        # sit on top of base
+        try:
+            streets_mesh = streets_mesh.copy()
+            streets_mesh.vertices[:,2] += base_h
+        except:
+            pass
+
+        objects=[('buildings', city_mesh), ('streets', streets_mesh)]
+
+        if bool(d.get('include_water', True)):
+            water_gdf = fetch_water(d['lat'], d['lon'], d['radius'])
+            water_mesh = create_water_mesh(water_gdf, d['lat'], d['lon'], d['radius'], d.get('target_size',80), float(d.get('water_height', 1.0)), z_offset=base_h)
+            if water_mesh is not None:
+                objects.append(('water', water_mesh))
+
+        data = export_3mf_bytes(objects)
+        return send_file(io.BytesIO(data), mimetype='model/3mf', as_attachment=True, download_name='combined.3mf')
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+
 @app.route('/api/health')
-def health():return jsonify({'status':'ok','version':'2.3','author':'SebGE','features':['streets','city3d','markers','multicolor']})
+def health():return jsonify({'status':'ok','version':'2.4','author':'SebGE','features':['streets','city3d','markers','multicolor','water','3mf']})
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',8080))
-    print(f"\n  🗺️  Map → STL v2.3 by SebGE\n  → http://localhost:{port}\n  Features: Streets + 3D City + Markers!\n")
+    print(f"\n  🗺️  Map → STL v2.4 by SebGE\n  → http://localhost:{port}\n  Features: Streets + 3D City + Markers!\n")
     app.run(host='0.0.0.0',port=port,debug=os.environ.get('DEBUG','false').lower()=='true')
