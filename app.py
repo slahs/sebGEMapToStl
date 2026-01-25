@@ -213,3 +213,7 @@ def health():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+@app.route("/")
+def index():
+    return "Map Export API is running", 200
