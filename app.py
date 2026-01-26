@@ -1,5 +1,5 @@
 """
-SebGE Tools v1.0
+SebGE Tools v1.1
 Created by SebGE - https://makerworld.com/de/@SebGE
 
 Tools:
@@ -16,6 +16,7 @@ from shapely.ops import unary_union
 import trimesh
 from PIL import Image, ImageFilter, ImageOps
 from skimage import feature, filters, measure
+from skimage.morphology import skeletonize, thin
 from scipy.ndimage import gaussian_filter1d
 
 app=Flask(__name__)
@@ -55,7 +56,7 @@ def geocode(q):
             if -90<=lat<=90 and -180<=lon<=180:return{'lat':lat,'lon':lon,'name':f'{lat:.4f}, {lon:.4f}'}
     except:pass
     try:
-        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'SebGETools/1.0'},timeout=10)
+        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'SebGETools/1.1'},timeout=10)
         if r.ok and r.json():d=r.json()[0];return{'lat':float(d['lat']),'lon':float(d['lon']),'name':d.get('display_name',q)[:50]}
     except:pass
     return None
@@ -231,13 +232,59 @@ def smooth_contour(contour, sigma):
     """Apply Gaussian smoothing to contour points."""
     if sigma <= 0 or len(contour) < 5:
         return contour
-    # Smooth x and y coordinates separately
     smoothed = np.zeros_like(contour)
     smoothed[:, 0] = gaussian_filter1d(contour[:, 0], sigma=sigma, mode='wrap')
     smoothed[:, 1] = gaussian_filter1d(contour[:, 1], sigma=sigma, mode='wrap')
     return smoothed
 
-def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False, mode='outline'):
+def trace_skeleton_to_paths(skeleton):
+    """Convert skeleton image to SVG paths by tracing connected pixels."""
+    paths = []
+    h, w = skeleton.shape
+    visited = np.zeros_like(skeleton, dtype=bool)
+    
+    # Find all skeleton pixels
+    points = np.argwhere(skeleton)
+    
+    def get_neighbors(r, c):
+        """Get unvisited neighboring skeleton pixels."""
+        neighbors = []
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and skeleton[nr, nc] and not visited[nr, nc]:
+                    neighbors.append((nr, nc))
+        return neighbors
+    
+    def trace_path(start_r, start_c):
+        """Trace a path from starting point."""
+        path = [(start_r, start_c)]
+        visited[start_r, start_c] = True
+        r, c = start_r, start_c
+        
+        while True:
+            neighbors = get_neighbors(r, c)
+            if not neighbors:
+                break
+            # Pick the first unvisited neighbor
+            r, c = neighbors[0]
+            path.append((r, c))
+            visited[r, c] = True
+        
+        return path
+    
+    # Trace all paths
+    for r, c in points:
+        if not visited[r, c]:
+            path = trace_path(r, c)
+            if len(path) >= 2:
+                paths.append(path)
+    
+    return paths
+
+def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False, mode='outline', single_line=False):
     """Convert image to SVG using PIL and scikit-image."""
     img = Image.open(io.BytesIO(img_data))
     if img.mode == 'RGBA':
@@ -258,6 +305,49 @@ def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=F
     
     img_array = np.array(gray)
     
+    # Single Line mode - use skeletonization
+    if single_line:
+        # Create binary image (dark areas = True)
+        binary = img_array < threshold
+        # Skeletonize to get single pixel width lines
+        skeleton = skeletonize(binary)
+        
+        # Trace skeleton to paths
+        skeleton_paths = trace_skeleton_to_paths(skeleton)
+        
+        svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n'
+        svg += f'<rect width="100%" height="100%" fill="white"/>\n'
+        
+        paths = []
+        for path in skeleton_paths:
+            if len(path) < 2:
+                continue
+            
+            # Apply smoothing
+            path_array = np.array(path, dtype=float)
+            if smooth > 0 and len(path_array) >= 5:
+                path_array = smooth_contour(path_array, sigma=smooth)
+            
+            # Simplify
+            step = max(1, simplify)
+            simplified = path_array[::step]
+            
+            if len(simplified) < 2:
+                continue
+            
+            # Build path (row,col -> x,y means swap)
+            d = f"M {simplified[0][1]:.1f},{simplified[0][0]:.1f}"
+            for p in simplified[1:]:
+                d += f" L {p[1]:.1f},{p[0]:.1f}"
+            paths.append(d)
+        
+        if paths:
+            svg += f'<path d="{" ".join(paths)}" fill="none" stroke="black" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>\n'
+        
+        svg += '</svg>'
+        return svg, len(paths), w, h
+    
+    # Normal contour-based modes
     if mode == 'outline':
         edges = feature.canny(img_array, sigma=blur+1, low_threshold=threshold*0.3, high_threshold=threshold)
         binary = edges.astype(np.uint8) * 255
@@ -285,14 +375,13 @@ def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=F
         if smooth > 0:
             contour = smooth_contour(contour, sigma=smooth)
         
-        # Then simplify (take every nth point)
+        # Then simplify
         step = max(1, simplify)
         simplified = contour[::step]
         
         if len(simplified) < 3:
             continue
         
-        # Build path (contours are in row,col format so we swap)
         points = simplified
         d = f"M {points[0][1]:.1f},{points[0][0]:.1f}"
         for p in points[1:]:
@@ -338,7 +427,6 @@ def image_to_filled_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, i
         if len(contour) < 3:
             continue
         
-        # Apply smoothing first
         if smooth > 0:
             contour = smooth_contour(contour, sigma=smooth)
         
@@ -505,7 +593,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-he
 <div class="mode active" data-mode="outline" onclick="setMode('outline')"><div class="icon">✏️</div><div class="name">Outline</div></div>
 <div class="mode" data-mode="filled" onclick="setMode('filled')"><div class="icon">⬛</div><div class="name">Filled</div></div>
 <div class="mode" data-mode="threshold" onclick="setMode('threshold')"><div class="icon">🔲</div><div class="name">Threshold</div></div>
-<div class="mode" data-mode="posterize" onclick="setMode('posterize')"><div class="icon">🎨</div><div class="name">Posterize</div></div>
+<div class="mode" data-mode="centerline" onclick="setMode('centerline')"><div class="icon">〰️</div><div class="name">Single Line</div></div>
 </div>
 </div>
 <div class="sec">
@@ -545,12 +633,10 @@ Upload an image to start
 <div class="sec" style="margin-top:12px">
 <div class="sec-title">Tips</div>
 <div style="font-size:9px;color:var(--t2);line-height:1.5">
-<strong style="color:var(--g)">Outline:</strong> Best for drawings & logos<br>
+<strong style="color:var(--g)">Outline:</strong> Edge detection<br>
 <strong style="color:var(--g)">Filled:</strong> Creates silhouettes<br>
 <strong style="color:var(--g)">Threshold:</strong> High contrast B/W<br>
-<strong style="color:var(--g)">Posterize:</strong> Reduces detail levels<br><br>
-<strong style="color:var(--g)">Blur:</strong> Reduces noise before tracing<br>
-<strong style="color:var(--g)">Simplify:</strong> Fewer points = smaller file<br>
+<strong style="color:var(--g)">Single Line:</strong> One clean line per stroke - perfect for pen plotters!<br><br>
 <strong style="color:var(--g)">Smoothing:</strong> Rounds out curves
 </div>
 </div>
@@ -595,7 +681,8 @@ async function convert(){
             blur:+$('blur').value,
             simplify:+$('simp').value,
             smooth:+$('smooth').value,
-            invert:$('invert').checked
+            invert:$('invert').checked,
+            singleLine: mode==='centerline'
         })});
         const d=await r.json();if(d.error)throw new Error(d.error);
         svgResult=d.svg;$('previewBox').innerHTML=svgResult;$('statPaths').textContent=d.paths;$('statSize').textContent=d.width+'×'+d.height;$('btnExport').disabled=false;showView('svg');msg('success','✓ Converted! '+d.paths+' paths');
@@ -709,15 +796,19 @@ def api_image_convert():
         simplify=d.get('simplify',2)
         smooth=d.get('smooth',0)
         invert=d.get('invert',False)
-        if mode=='filled':svg,paths,w,h=image_to_filled_svg(img_data,threshold,blur,simplify,smooth,invert)
-        else:svg,paths,w,h=image_to_svg(img_data,threshold,blur,simplify,smooth,invert,mode)
+        single_line=d.get('singleLine',False)
+        
+        if mode=='filled':
+            svg,paths,w,h=image_to_filled_svg(img_data,threshold,blur,simplify,smooth,invert)
+        else:
+            svg,paths,w,h=image_to_svg(img_data,threshold,blur,simplify,smooth,invert,mode,single_line)
         return jsonify({'svg':svg,'paths':paths,'width':w,'height':h})
     except Exception as e:return jsonify({'error':str(e)}),500
 
 @app.route('/api/health')
-def health():return jsonify({'status':'ok','version':'1.0','tools':['map','image'],'author':'SebGE'})
+def health():return jsonify({'status':'ok','version':'1.1','tools':['map','image'],'author':'SebGE'})
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',8080))
-    print(f"\n  🛠️  SebGE Tools v1.0\n  → http://localhost:{port}\n  Tools: Map→STL, Image→SVG\n")
+    print(f"\n  🛠️  SebGE Tools v1.1\n  → http://localhost:{port}\n  Tools: Map→STL, Image→SVG\n")
     app.run(host='0.0.0.0',port=port,debug=os.environ.get('DEBUG','false').lower()=='true')
