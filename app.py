@@ -6,18 +6,17 @@ Tools:
 1. Map→STL - 3D printable maps
 2. Image→SVG - Vectorize images
 """
-import os,io,requests,zipfile,base64
+import os,io,requests,base64
 from flask import Flask,request,jsonify,send_file,render_template_string
 from flask_cors import CORS
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import box,MultiPolygon,Polygon,LineString
+from shapely.geometry import box,Polygon,LineString
 from shapely.ops import unary_union
-from shapely.affinity import translate
 import trimesh
 from PIL import Image, ImageFilter, ImageOps
 from skimage import feature, filters, measure
-from skimage.color import rgb2gray
+from scipy.ndimage import gaussian_filter1d
 
 app=Flask(__name__)
 CORS(app)
@@ -227,13 +226,21 @@ def create_terrain_mesh(lat,lon,radius,size,height_scale,base_h):
     mesh=trimesh.Trimesh(vertices=verts,faces=faces);mesh.fix_normals()
     return mesh
 
-# ==================== IMAGE TO SVG (using PIL + scikit-image) ====================
-def image_to_svg(img_data, threshold=128, blur=1, simplify=2, invert=False, mode='outline'):
+# ==================== IMAGE TO SVG ====================
+def smooth_contour(contour, sigma):
+    """Apply Gaussian smoothing to contour points."""
+    if sigma <= 0 or len(contour) < 5:
+        return contour
+    # Smooth x and y coordinates separately
+    smoothed = np.zeros_like(contour)
+    smoothed[:, 0] = gaussian_filter1d(contour[:, 0], sigma=sigma, mode='wrap')
+    smoothed[:, 1] = gaussian_filter1d(contour[:, 1], sigma=sigma, mode='wrap')
+    return smoothed
+
+def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False, mode='outline'):
     """Convert image to SVG using PIL and scikit-image."""
-    # Load image with PIL
     img = Image.open(io.BytesIO(img_data))
     if img.mode == 'RGBA':
-        # Convert RGBA to RGB with white background
         bg = Image.new('RGB', img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[3])
         img = bg
@@ -241,42 +248,31 @@ def image_to_svg(img_data, threshold=128, blur=1, simplify=2, invert=False, mode
         img = img.convert('RGB')
     
     w, h = img.size
-    
-    # Convert to grayscale
     gray = img.convert('L')
     
-    # Apply blur if specified
     if blur > 0:
         gray = gray.filter(ImageFilter.GaussianBlur(radius=blur))
     
-    # Invert if needed
     if invert:
         gray = ImageOps.invert(gray)
     
-    # Convert to numpy array
     img_array = np.array(gray)
     
     if mode == 'outline':
-        # Edge detection using Canny
         edges = feature.canny(img_array, sigma=blur+1, low_threshold=threshold*0.3, high_threshold=threshold)
         binary = edges.astype(np.uint8) * 255
     elif mode == 'threshold':
-        # Simple threshold
         binary = (img_array < threshold).astype(np.uint8) * 255
     elif mode == 'adaptive':
-        # Adaptive threshold
         binary = (img_array < filters.threshold_local(img_array, block_size=35)).astype(np.uint8) * 255
     else:  # posterize
-        # Posterize then edge detect
         levels = max(2, min(8, threshold // 32))
         quantized = (img_array // (256 // levels)) * (256 // levels)
         edges = feature.canny(quantized, sigma=1)
         binary = edges.astype(np.uint8) * 255
     
-    # Find contours
     contours = measure.find_contours(binary, 0.5)
     
-    # Build SVG
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n'
     svg += f'<rect width="100%" height="100%" fill="white"/>\n'
     
@@ -285,14 +281,18 @@ def image_to_svg(img_data, threshold=128, blur=1, simplify=2, invert=False, mode
         if len(contour) < 3:
             continue
         
-        # Simplify contour (take every nth point)
+        # Apply smoothing first
+        if smooth > 0:
+            contour = smooth_contour(contour, sigma=smooth)
+        
+        # Then simplify (take every nth point)
         step = max(1, simplify)
         simplified = contour[::step]
         
         if len(simplified) < 3:
             continue
         
-        # Build path (note: contours are in row,col format so we swap)
+        # Build path (contours are in row,col format so we swap)
         points = simplified
         d = f"M {points[0][1]:.1f},{points[0][0]:.1f}"
         for p in points[1:]:
@@ -300,14 +300,13 @@ def image_to_svg(img_data, threshold=128, blur=1, simplify=2, invert=False, mode
         d += " Z"
         paths.append(d)
     
-    # Combine paths
     if paths:
         svg += f'<path d="{" ".join(paths)}" fill="none" stroke="black" stroke-width="1"/>\n'
     
     svg += '</svg>'
     return svg, len(paths), w, h
 
-def image_to_filled_svg(img_data, threshold=128, blur=1, simplify=2, invert=False):
+def image_to_filled_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False):
     """Create filled SVG (silhouette style)."""
     img = Image.open(io.BytesIO(img_data))
     if img.mode == 'RGBA':
@@ -338,6 +337,10 @@ def image_to_filled_svg(img_data, threshold=128, blur=1, simplify=2, invert=Fals
     for contour in contours:
         if len(contour) < 3:
             continue
+        
+        # Apply smoothing first
+        if smooth > 0:
+            contour = smooth_contour(contour, sigma=smooth)
         
         step = max(1, simplify)
         simplified = contour[::step]
@@ -513,6 +516,8 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-he
 <input type="range" id="blur" min="0" max="5" value="1" oninput="$('blurV').textContent=this.value"></div>
 <div class="slider"><div class="slider-head"><label>Simplify</label><span class="val" id="simpV">2</span></div>
 <input type="range" id="simp" min="1" max="10" value="2" oninput="$('simpV').textContent=this.value"></div>
+<div class="slider"><div class="slider-head"><label>Smoothing</label><span class="val" id="smoothV">0</span></div>
+<input type="range" id="smooth" min="0" max="10" value="0" oninput="$('smoothV').textContent=this.value"></div>
 <label class="checkbox"><input type="checkbox" id="invert"><span class="box"></span>Invert colors</label>
 </div>
 <button class="btn btn-secondary" id="btnPreview" onclick="convert()" disabled>👁 Preview</button>
@@ -544,8 +549,9 @@ Upload an image to start
 <strong style="color:var(--g)">Filled:</strong> Creates silhouettes<br>
 <strong style="color:var(--g)">Threshold:</strong> High contrast B/W<br>
 <strong style="color:var(--g)">Posterize:</strong> Reduces detail levels<br><br>
-Higher blur = smoother lines<br>
-Higher simplify = fewer points
+<strong style="color:var(--g)">Blur:</strong> Reduces noise before tracing<br>
+<strong style="color:var(--g)">Simplify:</strong> Fewer points = smaller file<br>
+<strong style="color:var(--g)">Smoothing:</strong> Rounds out curves
 </div>
 </div>
 </div>
@@ -582,7 +588,15 @@ async function convert(){
     if(!imageData)return;
     const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';
     try{
-        const r=await fetch('/api/image/convert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:imageData,mode,threshold:+$('thresh').value,blur:+$('blur').value,simplify:+$('simp').value,invert:$('invert').checked})});
+        const r=await fetch('/api/image/convert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+            image:imageData,
+            mode,
+            threshold:+$('thresh').value,
+            blur:+$('blur').value,
+            simplify:+$('simp').value,
+            smooth:+$('smooth').value,
+            invert:$('invert').checked
+        })});
         const d=await r.json();if(d.error)throw new Error(d.error);
         svgResult=d.svg;$('previewBox').innerHTML=svgResult;$('statPaths').textContent=d.paths;$('statSize').textContent=d.width+'×'+d.height;$('btnExport').disabled=false;showView('svg');msg('success','✓ Converted! '+d.paths+' paths');
     }catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='👁 Preview'}
@@ -689,9 +703,14 @@ def api_image_convert():
         d=request.json;img_b64=d['image']
         if ',' in img_b64:img_b64=img_b64.split(',')[1]
         img_data=base64.b64decode(img_b64)
-        mode=d.get('mode','outline');threshold=d.get('threshold',128);blur=d.get('blur',1);simplify=d.get('simplify',2);invert=d.get('invert',False)
-        if mode=='filled':svg,paths,w,h=image_to_filled_svg(img_data,threshold,blur,simplify,invert)
-        else:svg,paths,w,h=image_to_svg(img_data,threshold,blur,simplify,invert,mode)
+        mode=d.get('mode','outline')
+        threshold=d.get('threshold',128)
+        blur=d.get('blur',1)
+        simplify=d.get('simplify',2)
+        smooth=d.get('smooth',0)
+        invert=d.get('invert',False)
+        if mode=='filled':svg,paths,w,h=image_to_filled_svg(img_data,threshold,blur,simplify,smooth,invert)
+        else:svg,paths,w,h=image_to_svg(img_data,threshold,blur,simplify,smooth,invert,mode)
         return jsonify({'svg':svg,'paths':paths,'width':w,'height':h})
     except Exception as e:return jsonify({'error':str(e)}),500
 
