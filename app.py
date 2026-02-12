@@ -1,13 +1,7 @@
-"""
-SebGE Tools v1.1
-Created by SebGE - https://makerworld.com/de/@SebGE
-
-Tools:
-1. Map→STL - 3D printable maps
-2. Image→SVG - Vectorize images
-"""
+# -*- coding: utf-8 -*-
+"""SebGE Tools v1.2 - Map/Image/Print to STL"""
 import os,io,requests,base64
-from flask import Flask,request,jsonify,send_file,render_template_string
+from flask import Flask,request,jsonify,send_file
 from flask_cors import CORS
 import geopandas as gpd
 import numpy as np
@@ -15,14 +9,15 @@ from shapely.geometry import box,Polygon,LineString
 from shapely.ops import unary_union
 import trimesh
 from PIL import Image, ImageFilter, ImageOps
-from skimage import feature, filters, measure
-from skimage.morphology import skeletonize, thin
-from scipy.ndimage import gaussian_filter1d
+from skimage import feature, filters, measure, exposure
+from skimage.morphology import skeletonize
+from skimage.filters import threshold_otsu, gaussian
+from scipy.ndimage import gaussian_filter1d, uniform_filter, laplace
 
 app=Flask(__name__)
 CORS(app)
 
-# ==================== SHARED ====================
+# === MARKERS ===
 def create_heart(s=10):
     t=np.linspace(0,2*np.pi,80);x=16*np.sin(t)**3;y=13*np.cos(t)-5*np.cos(2*t)-2*np.cos(3*t)-np.cos(4*t)
     return Polygon(list(zip(x/32*s,y/32*s+s*0.1)))
@@ -36,16 +31,11 @@ def create_circle(s=10):
     t=np.linspace(0,2*np.pi,50);return Polygon([(s/2*np.cos(a),s/2*np.sin(a)) for a in t])
 MARKERS={'heart':create_heart,'star':create_star,'pin':create_pin,'circle':create_circle,'none':None}
 
-STREET_TYPES={
-    'motorway':'motorway|motorway_link','trunk':'trunk|trunk_link','primary':'primary|primary_link',
-    'secondary':'secondary|secondary_link','tertiary':'tertiary|tertiary_link','residential':'residential|living_street',
-    'unclassified':'unclassified','service':'service','pedestrian':'pedestrian','footway':'footway|steps',
-    'cycleway':'cycleway','track':'track','bridleway':'bridleway','path':'path'
-}
+STREET_TYPES={'motorway':'motorway|motorway_link','trunk':'trunk|trunk_link','primary':'primary|primary_link','secondary':'secondary|secondary_link','tertiary':'tertiary|tertiary_link','residential':'residential|living_street','unclassified':'unclassified','service':'service','pedestrian':'pedestrian','footway':'footway|steps','cycleway':'cycleway','track':'track','bridleway':'bridleway','path':'path'}
 
-# ==================== MAP FUNCTIONS ====================
+# === MAP FUNCTIONS ===
 def geocode(q):
-    known={'berlin':(52.52,13.405),'düsseldorf':(51.2277,6.7735),'köln':(50.9375,6.9603),'münchen':(48.1351,11.582),'hamburg':(53.5511,9.9937),'frankfurt':(50.1109,8.6821),'paris':(48.8566,2.3522),'new york':(40.7128,-74.006),'manhattan':(40.7831,-73.9712),'london':(51.5074,-0.1278),'tokyo':(35.6762,139.6503),'alps':(46.8,10.5),'matterhorn':(45.9763,7.6586)}
+    known={'berlin':(52.52,13.405),'dusseldorf':(51.2277,6.7735),'koln':(50.9375,6.9603),'munchen':(48.1351,11.582),'hamburg':(53.5511,9.9937),'frankfurt':(50.1109,8.6821),'paris':(48.8566,2.3522),'new york':(40.7128,-74.006),'london':(51.5074,-0.1278),'tokyo':(35.6762,139.6503)}
     ql=q.lower().strip()
     for n,c in known.items():
         if n in ql:return{'lat':c[0],'lon':c[1],'name':q}
@@ -56,7 +46,7 @@ def geocode(q):
             if -90<=lat<=90 and -180<=lon<=180:return{'lat':lat,'lon':lon,'name':f'{lat:.4f}, {lon:.4f}'}
     except:pass
     try:
-        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'SebGETools/1.1'},timeout=10)
+        r=requests.get('https://nominatim.openstreetmap.org/search',params={'q':q,'format':'json','limit':1},headers={'User-Agent':'SebGETools/1.2'},timeout=10)
         if r.ok and r.json():d=r.json()[0];return{'lat':float(d['lat']),'lon':float(d['lon']),'name':d.get('display_name',q)[:50]}
     except:pass
     return None
@@ -66,67 +56,67 @@ def fetch_streets(lat,lon,radius,types=None):
     tags=[STREET_TYPES[t] for t in types if t in STREET_TYPES]
     if not tags:tags=['residential']
     regex='|'.join(tags);bbox=radius/111000
-    q=f'[out:json][timeout:60];(way["highway"~"^({regex})$"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5}););out body;>;out skel qt;'
-    try:
-        r=requests.post('https://overpass-api.de/api/interpreter',data={'data':q},timeout=60)
-        if not r.ok:raise Exception("API error")
-        data=r.json();nodes={e['id']:(e['lon'],e['lat']) for e in data.get('elements',[]) if e['type']=='node'}
-        lines=[]
-        for e in data.get('elements',[]):
-            if e['type']=='way' and 'nodes' in e:
-                coords=[nodes[n] for n in e['nodes'] if n in nodes]
-                if len(coords)>=2:lines.append(LineString(coords))
-        if lines:return gpd.GeoDataFrame(geometry=lines,crs='EPSG:4326')
-    except Exception as ex:print(f"Streets error: {ex}")
-    import random;random.seed(int(abs(lat*1000+lon*100)));dl=radius/111320;dlo=dl/np.cos(np.radians(lat));lines=[]
-    for i in range(6):
-        y=lat-dl+(2*dl*i/5);lines.append(LineString([(lon-dlo+(2*dlo*j/20),y+random.uniform(-dl*.02,dl*.02)) for j in range(21)]))
-        x=lon-dlo+(2*dlo*i/5);lines.append(LineString([(x+random.uniform(-dlo*.02,dlo*.02),lat-dl+(2*dl*j/20)) for j in range(21)]))
-    return gpd.GeoDataFrame(geometry=lines,crs='EPSG:4326')
+    q=f'[out:json][timeout:90];(way["highway"~"^({regex})$"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5}););out body;>;out skel qt;'
+    
+    # Try multiple Overpass servers
+    servers = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+    ]
+    
+    for server in servers:
+        try:
+            r=requests.post(server,data={'data':q},timeout=90,headers={'User-Agent':'SebGE-Tools/1.4'})
+            if r.ok and r.text.strip().startswith('{'):
+                data=r.json()
+                nodes={e['id']:(e['lon'],e['lat']) for e in data.get('elements',[]) if e['type']=='node'}
+                lines=[]
+                for e in data.get('elements',[]):
+                    if e['type']=='way' and 'nodes' in e:
+                        coords=[nodes[n] for n in e['nodes'] if n in nodes]
+                        if len(coords)>=2:
+                            lines.append(LineString(coords))
+                if lines:
+                    print(f"Fetched {len(lines)} streets from {server}")
+                    return gpd.GeoDataFrame(geometry=lines,crs='EPSG:4326')
+        except Exception as ex:
+            print(f"Server {server} failed: {ex}")
+            continue
+    
+    # If all servers fail, raise error instead of returning fake data
+    raise ValueError(f"Could not fetch street data for {lat},{lon}. All Overpass servers failed.")
 
 def fetch_buildings(lat,lon,radius):
-    bbox=radius/111000
-    q=f'[out:json][timeout:60];way["building"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});out body;>;out skel qt;'
-    try:
-        r=requests.post('https://overpass-api.de/api/interpreter',data={'data':q},timeout=60)
-        if not r.ok:return[]
-        data=r.json();nodes={e['id']:(e['lon'],e['lat']) for e in data.get('elements',[]) if e['type']=='node'}
-        buildings=[]
-        for e in data.get('elements',[]):
-            if e['type']=='way' and 'nodes' in e:
-                coords=[nodes[n] for n in e['nodes'] if n in nodes]
-                if len(coords)>=4:
-                    try:
-                        poly=Polygon(coords)
-                        if poly.is_valid and poly.area>0:
-                            tags=e.get('tags',{});h=10
-                            if 'height' in tags:
-                                try:h=float(tags['height'].replace('m',''))
-                                except:pass
-                            elif 'building:levels' in tags:
-                                try:h=float(tags['building:levels'])*3
-                                except:pass
-                            buildings.append({'geometry':poly,'height':h})
-                    except:pass
-        return buildings
-    except:return[]
-
-def fetch_water(lat,lon,radius):
-    bbox=radius/111000
-    q=f'[out:json][timeout:60];(way["natural"="water"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});way["waterway"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5}););out body;>;out skel qt;'
-    try:
-        r=requests.post('https://overpass-api.de/api/interpreter',data={'data':q},timeout=60)
-        if not r.ok:return[]
-        data=r.json();nodes={e['id']:(e['lon'],e['lat']) for e in data.get('elements',[]) if e['type']=='node'}
-        water=[]
-        for e in data.get('elements',[]):
-            if e['type']=='way' and 'nodes' in e:
-                coords=[nodes[n] for n in e['nodes'] if n in nodes]
-                if len(coords)>=3:
-                    try:poly=Polygon(coords);water.append(poly) if poly.is_valid else None
-                    except:pass
-        return water
-    except:return[]
+    bbox=radius/111000;q=f'[out:json][timeout:90];way["building"]({lat-bbox},{lon-bbox*1.5},{lat+bbox},{lon+bbox*1.5});out body;>;out skel qt;'
+    
+    servers = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
+    ]
+    
+    for server in servers:
+        try:
+            r=requests.post(server,data={'data':q},timeout=90,headers={'User-Agent':'SebGE-Tools/1.4'})
+            if not r.ok or not r.text.strip().startswith('{'):continue
+            data=r.json();nodes={e['id']:(e['lon'],e['lat']) for e in data.get('elements',[]) if e['type']=='node'}
+            buildings=[]
+            for e in data.get('elements',[]):
+                if e['type']=='way' and 'nodes' in e:
+                    coords=[nodes[n] for n in e['nodes'] if n in nodes]
+                    if len(coords)>=4:
+                        try:
+                            poly=Polygon(coords)
+                            if poly.is_valid and poly.area>0:buildings.append({'geometry':poly,'height':10})
+                        except:pass
+            if buildings:
+                print(f"Fetched {len(buildings)} buildings from {server}")
+                return buildings
+        except Exception as ex:
+            print(f"Buildings server {server} failed: {ex}")
+            continue
+    return []
 
 def fetch_elevation(lat,lon,radius,res=80):
     dl=radius/111320;dlo=dl/np.cos(np.radians(lat))
@@ -174,7 +164,7 @@ def create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker_type='none',mar
     return result
 
 def create_city_mesh(lat,lon,radius,size,street_h,lw,building_scale,base_h):
-    gdf=fetch_streets(lat,lon,radius);buildings=fetch_buildings(lat,lon,radius);water=fetch_water(lat,lon,radius)
+    gdf=fetch_streets(lat,lon,radius);buildings=fetch_buildings(lat,lon,radius)
     gp=gdf.to_crs(gdf.estimate_utm_crs());utm=gp.crs
     ctr=gpd.GeoDataFrame(geometry=gpd.points_from_xy([lon],[lat]),crs='EPSG:4326').to_crs(utm).geometry.iloc[0]
     sc=size/(2*radius);meshes=[trimesh.creation.extrude_polygon(box(-size/2,-size/2,size/2,size/2),base_h)]
@@ -196,13 +186,6 @@ def create_city_mesh(lat,lon,radius,size,street_h,lw,building_scale,base_h):
             bh=max(b['height']*building_scale*sc,0.5)
             m=trimesh.creation.extrude_polygon(bp if bp.geom_type=='Polygon' else list(bp.geoms)[0],bh)
             m.vertices[:,2]+=base_h+street_h;meshes.append(m)
-        except:pass
-    for w in water:
-        try:
-            wg=gpd.GeoDataFrame(geometry=[w],crs='EPSG:4326').to_crs(utm).geometry.iloc[0]
-            c=np.array(wg.exterior.coords);c[:,0]=(c[:,0]-ctr.x)*sc;c[:,1]=(c[:,1]-ctr.y)*sc
-            wp=Polygon(c.tolist()).intersection(box(-size/2,-size/2,size/2,size/2))
-            if not wp.is_empty:meshes.append(trimesh.creation.extrude_polygon(wp if wp.geom_type=='Polygon' else list(wp.geoms)[0],base_h*0.5))
         except:pass
     result=trimesh.util.concatenate(meshes);result.fill_holes();result.fix_normals()
     return result
@@ -227,506 +210,1016 @@ def create_terrain_mesh(lat,lon,radius,size,height_scale,base_h):
     mesh=trimesh.Trimesh(vertices=verts,faces=faces);mesh.fix_normals()
     return mesh
 
-# ==================== IMAGE TO SVG ====================
+# === IMAGE TO SVG ===
 def smooth_contour(contour, sigma):
-    """Apply Gaussian smoothing to contour points."""
-    if sigma <= 0 or len(contour) < 5:
-        return contour
+    if sigma <= 0 or len(contour) < 5:return contour
     smoothed = np.zeros_like(contour)
     smoothed[:, 0] = gaussian_filter1d(contour[:, 0], sigma=sigma, mode='wrap')
     smoothed[:, 1] = gaussian_filter1d(contour[:, 1], sigma=sigma, mode='wrap')
     return smoothed
 
-def trace_skeleton_to_paths(skeleton):
-    """Convert skeleton image to SVG paths by tracing connected pixels."""
-    paths = []
-    h, w = skeleton.shape
-    visited = np.zeros_like(skeleton, dtype=bool)
-    
-    # Find all skeleton pixels
-    points = np.argwhere(skeleton)
-    
-    def get_neighbors(r, c):
-        """Get unvisited neighboring skeleton pixels."""
-        neighbors = []
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and skeleton[nr, nc] and not visited[nr, nc]:
-                    neighbors.append((nr, nc))
-        return neighbors
-    
-    def trace_path(start_r, start_c):
-        """Trace a path from starting point."""
-        path = [(start_r, start_c)]
-        visited[start_r, start_c] = True
-        r, c = start_r, start_c
-        
-        while True:
-            neighbors = get_neighbors(r, c)
-            if not neighbors:
-                break
-            # Pick the first unvisited neighbor
-            r, c = neighbors[0]
-            path.append((r, c))
-            visited[r, c] = True
-        
-        return path
-    
-    # Trace all paths
-    for r, c in points:
-        if not visited[r, c]:
-            path = trace_path(r, c)
-            if len(path) >= 2:
-                paths.append(path)
-    
-    return paths
-
 def image_to_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False, mode='outline', single_line=False):
-    """Convert image to SVG using PIL and scikit-image."""
     img = Image.open(io.BytesIO(img_data))
-    if img.mode == 'RGBA':
-        bg = Image.new('RGB', img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[3])
-        img = bg
-    elif img.mode != 'RGB':
-        img = img.convert('RGB')
-    
-    w, h = img.size
-    gray = img.convert('L')
-    
-    if blur > 0:
-        gray = gray.filter(ImageFilter.GaussianBlur(radius=blur))
-    
-    if invert:
-        gray = ImageOps.invert(gray)
-    
+    if img.mode == 'RGBA':bg = Image.new('RGB', img.size, (255, 255, 255));bg.paste(img, mask=img.split()[3]);img = bg
+    elif img.mode != 'RGB':img = img.convert('RGB')
+    w, h = img.size;gray = img.convert('L')
+    if blur > 0:gray = gray.filter(ImageFilter.GaussianBlur(radius=blur))
+    if invert:gray = ImageOps.invert(gray)
     img_array = np.array(gray)
-    
-    # Single Line mode - use skeletonization
     if single_line:
-        # Create binary image (dark areas = True)
-        binary = img_array < threshold
-        # Skeletonize to get single pixel width lines
-        skeleton = skeletonize(binary)
-        
-        # Trace skeleton to paths
-        skeleton_paths = trace_skeleton_to_paths(skeleton)
-        
-        svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n'
-        svg += f'<rect width="100%" height="100%" fill="white"/>\n'
-        
-        paths = []
-        for path in skeleton_paths:
-            if len(path) < 2:
-                continue
-            
-            # Apply smoothing
-            path_array = np.array(path, dtype=float)
-            if smooth > 0 and len(path_array) >= 5:
-                path_array = smooth_contour(path_array, sigma=smooth)
-            
-            # Simplify
-            step = max(1, simplify)
-            simplified = path_array[::step]
-            
-            if len(simplified) < 2:
-                continue
-            
-            # Build path (row,col -> x,y means swap)
-            d = f"M {simplified[0][1]:.1f},{simplified[0][0]:.1f}"
-            for p in simplified[1:]:
-                d += f" L {p[1]:.1f},{p[0]:.1f}"
-            paths.append(d)
-        
-        if paths:
-            svg += f'<path d="{" ".join(paths)}" fill="none" stroke="black" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>\n'
-        
-        svg += '</svg>'
-        return svg, len(paths), w, h
-    
-    # Normal contour-based modes
+        binary = img_array < threshold;skeleton = skeletonize(binary)
+        points = np.argwhere(skeleton);paths = []
+        svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}"><rect width="100%" height="100%" fill="white"/>'
+        if len(points) > 0:
+            svg += f'<path d="M {points[0][1]} {points[0][0]}'
+            for p in points[1::max(1,simplify)]:svg += f' L {p[1]} {p[0]}'
+            svg += '" fill="none" stroke="black" stroke-width="1"/>'
+        svg += '</svg>';return svg, len(points)//max(1,simplify), w, h
     if mode == 'outline':
         edges = feature.canny(img_array, sigma=blur+1, low_threshold=threshold*0.3, high_threshold=threshold)
         binary = edges.astype(np.uint8) * 255
-    elif mode == 'threshold':
-        binary = (img_array < threshold).astype(np.uint8) * 255
-    elif mode == 'adaptive':
-        binary = (img_array < filters.threshold_local(img_array, block_size=35)).astype(np.uint8) * 255
-    else:  # posterize
-        levels = max(2, min(8, threshold // 32))
-        quantized = (img_array // (256 // levels)) * (256 // levels)
-        edges = feature.canny(quantized, sigma=1)
-        binary = edges.astype(np.uint8) * 255
-    
+    else:binary = (img_array < threshold).astype(np.uint8) * 255
     contours = measure.find_contours(binary, 0.5)
-    
-    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n'
-    svg += f'<rect width="100%" height="100%" fill="white"/>\n'
-    
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}"><rect width="100%" height="100%" fill="white"/>'
     paths = []
     for contour in contours:
-        if len(contour) < 3:
-            continue
-        
-        # Apply smoothing first
-        if smooth > 0:
-            contour = smooth_contour(contour, sigma=smooth)
-        
-        # Then simplify
-        step = max(1, simplify)
-        simplified = contour[::step]
-        
-        if len(simplified) < 3:
-            continue
-        
-        points = simplified
-        d = f"M {points[0][1]:.1f},{points[0][0]:.1f}"
-        for p in points[1:]:
-            d += f" L {p[1]:.1f},{p[0]:.1f}"
-        d += " Z"
-        paths.append(d)
-    
-    if paths:
-        svg += f'<path d="{" ".join(paths)}" fill="none" stroke="black" stroke-width="1"/>\n'
-    
-    svg += '</svg>'
-    return svg, len(paths), w, h
+        if len(contour) < 3:continue
+        if smooth > 0:contour = smooth_contour(contour, sigma=smooth)
+        simplified = contour[::max(1, simplify)]
+        if len(simplified) < 3:continue
+        d = f"M {simplified[0][1]:.1f},{simplified[0][0]:.1f}"
+        for p in simplified[1:]:d += f" L {p[1]:.1f},{p[0]:.1f}"
+        d += " Z";paths.append(d)
+    if paths:svg += f'<path d="{" ".join(paths)}" fill="none" stroke="black" stroke-width="1"/>'
+    svg += '</svg>';return svg, len(paths), w, h
 
 def image_to_filled_svg(img_data, threshold=128, blur=1, simplify=2, smooth=0, invert=False):
-    """Create filled SVG (silhouette style)."""
     img = Image.open(io.BytesIO(img_data))
-    if img.mode == 'RGBA':
-        bg = Image.new('RGB', img.size, (255, 255, 255))
-        bg.paste(img, mask=img.split()[3])
-        img = bg
-    elif img.mode != 'RGB':
-        img = img.convert('RGB')
-    
-    w, h = img.size
-    gray = img.convert('L')
-    
-    if blur > 0:
-        gray = gray.filter(ImageFilter.GaussianBlur(radius=blur))
-    
-    if invert:
-        gray = ImageOps.invert(gray)
-    
-    img_array = np.array(gray)
-    binary = (img_array < threshold).astype(np.uint8) * 255
-    
+    if img.mode == 'RGBA':bg = Image.new('RGB', img.size, (255, 255, 255));bg.paste(img, mask=img.split()[3]);img = bg
+    elif img.mode != 'RGB':img = img.convert('RGB')
+    w, h = img.size;gray = img.convert('L')
+    if blur > 0:gray = gray.filter(ImageFilter.GaussianBlur(radius=blur))
+    if invert:gray = ImageOps.invert(gray)
+    img_array = np.array(gray);binary = (img_array < threshold).astype(np.uint8) * 255
     contours = measure.find_contours(binary, 0.5)
-    
-    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n'
-    svg += f'<rect width="100%" height="100%" fill="white"/>\n'
-    
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}"><rect width="100%" height="100%" fill="white"/>'
     paths = []
     for contour in contours:
-        if len(contour) < 3:
-            continue
-        
-        if smooth > 0:
-            contour = smooth_contour(contour, sigma=smooth)
-        
-        step = max(1, simplify)
-        simplified = contour[::step]
-        
-        if len(simplified) < 3:
-            continue
-        
-        points = simplified
-        d = f"M {points[0][1]:.1f},{points[0][0]:.1f}"
-        for p in points[1:]:
-            d += f" L {p[1]:.1f},{p[0]:.1f}"
-        d += " Z"
-        paths.append(d)
-    
-    if paths:
-        svg += f'<path d="{" ".join(paths)}" fill="black" stroke="none" fill-rule="evenodd"/>\n'
-    
-    svg += '</svg>'
-    return svg, len(paths), w, h
+        if len(contour) < 3:continue
+        if smooth > 0:contour = smooth_contour(contour, sigma=smooth)
+        simplified = contour[::max(1, simplify)]
+        if len(simplified) < 3:continue
+        d = f"M {simplified[0][1]:.1f},{simplified[0][0]:.1f}"
+        for p in simplified[1:]:d += f" L {p[1]:.1f},{p[0]:.1f}"
+        d += " Z";paths.append(d)
+    if paths:svg += f'<path d="{" ".join(paths)}" fill="black" stroke="none" fill-rule="evenodd"/>'
+    svg += '</svg>';return svg, len(paths), w, h
 
-# ==================== HTML TEMPLATES ====================
-LANDING_HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>SebGE Tools | 3D Print & Design</title>
+# === PRINT TO STL ===
+def analyze_print_image(img_data):
+    img = Image.open(io.BytesIO(img_data))
+    if img.mode == 'RGBA':bg = Image.new('RGB', img.size, (255, 255, 255));bg.paste(img, mask=img.split()[3]);img = bg
+    elif img.mode != 'RGB':img = img.convert('RGB')
+    gray = np.array(img.convert('L'));warnings = []
+    mean_brightness = np.mean(gray)
+    if mean_brightness < 60:warnings.append("Image is very dark")
+    elif mean_brightness > 220:warnings.append("Image is very bright")
+    contrast = np.std(gray)
+    if contrast < 30:warnings.append("Low contrast")
+    quality_score = 100
+    if mean_brightness < 60 or mean_brightness > 220:quality_score -= 25
+    if contrast < 30:quality_score -= 20
+    return {'width': img.size[0],'height': img.size[1],'quality_score': max(0, quality_score),'warnings': warnings}
+
+def process_print_image(img_data, enhance_contrast=1.5, denoise=2):
+    img = Image.open(io.BytesIO(img_data))
+    if img.mode == 'RGBA':bg = Image.new('RGB', img.size, (255, 255, 255));bg.paste(img, mask=img.split()[3]);img = bg
+    elif img.mode != 'RGB':img = img.convert('RGB')
+    gray = np.array(img.convert('L')).astype(float)
+    # Denoise
+    if denoise > 0:gray = gaussian(gray, sigma=denoise, preserve_range=True)
+    # Detect background (assume corners are background)
+    h, w = gray.shape
+    corner_size = max(10, min(h, w) // 10)
+    corners = [gray[:corner_size, :corner_size], gray[:corner_size, -corner_size:], 
+               gray[-corner_size:, :corner_size], gray[-corner_size:, -corner_size:]]
+    bg_value = np.median([np.median(c) for c in corners])
+    # Normalize: background becomes white (255), darker areas become darker
+    if bg_value > 128:  # Light background (normal case)
+        # Stretch contrast: bg_value->255 (white), darkest->0 (black)
+        p_dark = np.percentile(gray, 2)
+        gray = np.clip((gray - p_dark) / (bg_value - p_dark + 1e-8) * 255, 0, 255)
+    else:  # Dark background - invert
+        p_light = np.percentile(gray, 98)
+        gray = 255 - np.clip((gray - bg_value) / (p_light - bg_value + 1e-8) * 255, 0, 255)
+    # Apply contrast enhancement
+    if enhance_contrast > 1:
+        mid = 128
+        gray = mid + (gray - mid) * enhance_contrast
+        gray = np.clip(gray, 0, 255)
+    # Final normalization to use full range
+    p2, p98 = np.percentile(gray, (1, 99))
+    gray = exposure.rescale_intensity(gray, in_range=(p2, p98), out_range=(0, 255))
+    return gray.astype(np.uint8)
+
+def create_hueforge_preview(gray, num_colors=2):
+    h, w = gray.shape;preview = np.zeros((h, w, 3), dtype=np.uint8)
+    # HueForge: White (255) = thin = light areas, Black (0) = thick = dark areas
+    if num_colors == 2:
+        # 2 colors: White base, Black on top for dark areas
+        preview[gray >= 128] = [255, 255, 255]  # Light areas stay white
+        preview[gray < 128] = [30, 30, 30]       # Dark areas become black
+    else:
+        # 3 colors: White base, Gray middle, Black for darkest
+        preview[gray >= 170] = [255, 255, 255]  # Lightest = white
+        preview[(gray >= 85) & (gray < 170)] = [120, 120, 120]  # Mid = gray
+        preview[gray < 85] = [30, 30, 30]        # Darkest = black
+    return preview
+
+def create_relief_stl(gray, width_mm=100, total_height_mm=2.4, base_height_mm=0.6, border_mm=2):
+    h, w = gray.shape;aspect = h / w;width = width_mm;height = width * aspect
+    if border_mm > 0:
+        padded = np.pad(gray, pad_width=int(border_mm * w / width_mm), mode='constant', constant_values=255)
+        gray = padded;h, w = gray.shape;height = width * (h / w)
+    max_res = 400
+    if w > max_res or h > max_res:
+        scale = max_res / max(w, h);new_w, new_h = int(w * scale), int(h * scale)
+        img = Image.fromarray(gray);img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        gray = np.array(img);h, w = gray.shape
+    relief_height = total_height_mm - base_height_mm
+    normalized = 1.0 - (gray.astype(float) / 255.0)
+    heights = base_height_mm + normalized * relief_height
+    step_x = width / (w - 1);step_y = height / (h - 1)
+    vertices = [];faces = []
+    for i in range(h):
+        for j in range(w):vertices.append([j * step_x, (h - 1 - i) * step_y, heights[i, j]])
+    for i in range(h):
+        for j in range(w):vertices.append([j * step_x, (h - 1 - i) * step_y, 0])
+    n = w;off = h * w
+    for i in range(h - 1):
+        for j in range(w - 1):
+            v0, v1, v2, v3 = i*n+j, i*n+j+1, (i+1)*n+j, (i+1)*n+j+1
+            faces.append([v0, v2, v1]);faces.append([v1, v2, v3])
+    for i in range(h - 1):
+        for j in range(w - 1):
+            v0, v1, v2, v3 = off+i*n+j, off+i*n+j+1, off+(i+1)*n+j, off+(i+1)*n+j+1
+            faces.append([v0, v1, v2]);faces.append([v1, v3, v2])
+    for j in range(w - 1):faces.append([j, j+1, off+j]);faces.append([j+1, off+j+1, off+j])
+    for j in range(w - 1):
+        t0, t1 = (h-1)*n+j, (h-1)*n+j+1;b0, b1 = off+(h-1)*n+j, off+(h-1)*n+j+1
+        faces.append([t0, b0, t1]);faces.append([t1, b0, b1])
+    for i in range(h - 1):
+        t0, t1 = i*n, (i+1)*n;b0, b1 = off+i*n, off+(i+1)*n
+        faces.append([t0, b0, t1]);faces.append([t1, b0, b1])
+    for i in range(h - 1):
+        t0, t1 = i*n+w-1, (i+1)*n+w-1;b0, b1 = off+i*n+w-1, off+(i+1)*n+w-1
+        faces.append([t0, t1, b0]);faces.append([t1, b1, b0])
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces);mesh.fix_normals()
+    return mesh, width, height
+
+def calculate_print_instructions(total_height_mm, base_height_mm, layer_height_mm, num_colors):
+    total_layers = int(round(total_height_mm / layer_height_mm))
+    base_layers = int(round(base_height_mm / layer_height_mm))
+    if num_colors == 2:
+        return {'total_layers': total_layers, 'summary': f"Layer Height: {layer_height_mm}mm | Total: {total_height_mm}mm | Layers: {total_layers}\n\n1. Start WHITE\n2. Change BLACK at Layer {base_layers} (Z={base_height_mm}mm)"}
+    else:
+        relief = total_height_mm - base_height_mm
+        g_layer = int(round((base_height_mm + relief * 0.33) / layer_height_mm))
+        b_layer = int(round((base_height_mm + relief * 0.66) / layer_height_mm))
+        return {'total_layers': total_layers, 'summary': f"Layer Height: {layer_height_mm}mm | Total: {total_height_mm}mm | Layers: {total_layers}\n\n1. Start WHITE\n2. GRAY at Layer {g_layer}\n3. BLACK at Layer {b_layer}"}
+
+# === HTML TEMPLATES ===
+
+# === HTML TEMPLATES ===
+LANDING = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SebGE Tools</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--g:#00AE42;--gd:#009639;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
-body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
-.logo{display:flex;align-items:center;gap:16px;margin-bottom:12px}
-.logo-icon{width:64px;height:64px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:32px;box-shadow:0 8px 32px rgba(0,174,66,.3)}
-.logo h1{font-size:32px;font-weight:800}
-.logo small{display:block;font-size:12px;color:var(--g);margin-top:4px}
-.creator{display:flex;align-items:center;gap:10px;background:var(--c);border:1px solid var(--g);border-radius:30px;padding:8px 20px 8px 8px;text-decoration:none;margin-bottom:40px;transition:all .2s}
-.creator:hover{background:var(--c2);transform:translateY(-2px)}
-.cr-av{width:32px;height:32px;background:var(--g);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
-.cr-info{font-size:12px}
-.cr-name{font-weight:600}
-.cr-link{color:var(--g);font-size:10px}
-.tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;max-width:800px;width:100%}
-.tool{background:var(--c);border:2px solid var(--br);border-radius:20px;padding:32px;text-align:center;text-decoration:none;color:var(--t);transition:all .2s;position:relative;overflow:hidden}
-.tool::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(135deg,rgba(0,174,66,.1),transparent);opacity:0;transition:opacity .2s}
-.tool:hover{border-color:var(--g);transform:translateY(-4px);box-shadow:0 12px 40px rgba(0,174,66,.2)}
-.tool:hover::before{opacity:1}
-.tool-icon{font-size:56px;margin-bottom:16px;display:block}
-.tool-name{font-size:20px;font-weight:700;margin-bottom:8px}
-.tool-desc{font-size:13px;color:var(--t2);line-height:1.5}
-.tool-badge{position:absolute;top:16px;right:16px;background:var(--g);color:#fff;font-size:9px;padding:4px 10px;border-radius:20px;font-weight:700}
-.footer{margin-top:60px;text-align:center;color:var(--t2);font-size:11px}
-.footer a{color:var(--g);text-decoration:none}
-@media(max-width:600px){.tools{grid-template-columns:1fr}.logo h1{font-size:24px}}
+body{font-family:system-ui;background:#0a0a0a;color:#fff;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+.logo{font-size:28px;font-weight:800;margin-bottom:6px}
+.sub{color:#00AE42;font-size:11px;margin-bottom:24px;letter-spacing:1px}
+.tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;max-width:400px;width:100%}
+.tool{background:#151515;border:2px solid #2a2a2a;border-radius:12px;padding:20px 16px;text-align:center;text-decoration:none;color:#fff;transition:all .2s}
+.tool:hover{border-color:#00AE42;transform:translateY(-2px)}
+.tool:active{transform:scale(0.98)}
+.tool .icon{font-size:28px;margin-bottom:8px}
+.tool h3{font-size:13px;margin:0 0 4px}
+.tool p{font-size:10px;color:#888}
+.footer{margin-top:30px;font-size:10px;color:#888}
+.footer a{color:#00AE42;text-decoration:none}
+@media(max-width:400px){
+    .tools{grid-template-columns:1fr}
+    .tool{padding:16px}
+}
 </style></head><body>
-<div class="logo">
-<div class="logo-icon">🛠️</div>
-<div><h1>SebGE Tools</h1><small>3D PRINT & DESIGN TOOLS</small></div>
-</div>
-<a href="https://makerworld.com/de/@SebGE" target="_blank" class="creator">
-<div class="cr-av">S</div>
-<div class="cr-info"><div class="cr-name">Created by SebGE</div><div class="cr-link">MakerWorld Profile →</div></div>
-</a>
+<div class="logo">SebGE Tools</div>
+<div class="sub">3D PRINT & DESIGN</div>
 <div class="tools">
-<a href="/map" class="tool">
-<span class="tool-badge">3D PRINT</span>
-<span class="tool-icon">🗺️</span>
-<div class="tool-name">Map → STL</div>
-<div class="tool-desc">Create 3D printable maps from any location. Streets, cities, or terrain with real elevation data.</div>
-</a>
-<a href="/image" class="tool">
-<span class="tool-badge">VECTOR</span>
-<span class="tool-icon">🎨</span>
-<div class="tool-name">Image → SVG</div>
-<div class="tool-desc">Convert images to vector graphics. Perfect for laser cutting, vinyl cutting, or clean scaling.</div>
-</a>
+<a href="/map" class="tool"><div class="icon">🗺️</div><h3>Map → STL</h3><p>3D printable maps</p></a>
+<a href="/image" class="tool"><div class="icon">🖼️</div><h3>Image → SVG</h3><p>Vectorize images</p></a>
 </div>
-<div class="footer">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a> • Open Source Tools for Makers</div>
-</body></html>'''
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+</body></html>"""
 
-IMAGE_HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Image→SVG | SebGE Tools</title>
+IMAGE_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Image to SVG | SebGE Tools</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--g:#00AE42;--gd:#009639;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
-body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh}
-.app{display:grid;grid-template-columns:280px 1fr 280px;height:100vh}
-.panel{background:var(--c);padding:16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto}
-.panel::-webkit-scrollbar{width:5px}
-.panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}
-.logo{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--br)}
-.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
-.logo h1{font-size:14px;font-weight:700}
-.logo small{display:block;font-size:8px;color:var(--g);margin-top:2px}
-.back{display:inline-flex;align-items:center;gap:6px;color:var(--t2);text-decoration:none;font-size:10px;margin-bottom:8px}
+:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
+body{font-family:system-ui;background:var(--bg);color:var(--t);min-height:100vh}
+.app{display:grid;grid-template-columns:260px 1fr 200px;height:100vh}
+.panel{background:var(--c);padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.back{color:var(--t2);text-decoration:none;font-size:10px}
 .back:hover{color:var(--g)}
-.upload-area{border:2px dashed var(--br);border-radius:12px;padding:32px 16px;text-align:center;cursor:pointer;transition:all .2s}
-.upload-area:hover{border-color:var(--g);background:rgba(0,174,66,.05)}
-.upload-area.dragover{border-color:var(--g);background:rgba(0,174,66,.1)}
-.upload-icon{font-size:40px;margin-bottom:8px}
-.upload-text{font-size:11px;color:var(--t2)}
-.upload-text strong{color:var(--t);display:block;margin-bottom:4px}
-#fileInput{display:none}
-.sec{background:var(--c2);border-radius:8px;padding:12px}
-.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--g);margin-bottom:10px}
-.modes{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
-.mode{padding:10px 8px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;transition:all .15s}
-.mode:hover{border-color:var(--g)}
-.mode.active{border-color:var(--g);background:rgba(0,174,66,.1)}
-.mode .icon{font-size:18px}
-.mode .name{font-size:9px;font-weight:600;margin-top:4px}
-.slider{margin-bottom:8px}
-.slider-head{display:flex;justify-content:space-between;margin-bottom:3px}
-.slider label{font-size:10px;color:var(--t2)}
-.slider .val{font-size:10px;color:var(--g);font-family:monospace;font-weight:600}
+.logo{display:flex;align-items:center;gap:8px;padding-bottom:8px;border-bottom:1px solid var(--br)}
+.logo-icon{width:32px;height:32px;background:var(--g);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px}
+.logo h1{font-size:13px}
+.logo small{font-size:7px;color:var(--g)}
+.sec{background:var(--c2);border-radius:6px;padding:10px}
+.sec-title{font-size:8px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:600}
+.upload{border:2px dashed var(--br);border-radius:6px;padding:20px 10px;text-align:center;cursor:pointer}
+.upload:hover{border-color:var(--g)}
+.upload p{font-size:10px;color:var(--t2)}
+.upload.has-img{padding:8px}
+.upload img{max-width:100%;max-height:100px;border-radius:4px}
+#file{display:none}
+.modes{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.mode{padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:4px;cursor:pointer;text-align:center;font-size:9px}
+.mode:hover,.mode.active{border-color:var(--g)}
+.slider{margin-bottom:4px}
+.slider-head{display:flex;justify-content:space-between;margin-bottom:2px}
+.slider label{font-size:9px;color:var(--t2)}
+.slider .val{font-size:9px;color:var(--g);font-family:monospace}
 .slider input{width:100%;height:4px;background:var(--c);border-radius:2px;-webkit-appearance:none}
 .slider input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}
-.checkbox{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;padding:8px 0}
-.checkbox input{display:none}
-.checkbox .box{width:18px;height:18px;border:2px solid var(--br);border-radius:4px;display:flex;align-items:center;justify-content:center;transition:all .15s}
-.checkbox input:checked+.box{background:var(--g);border-color:var(--g)}
-.checkbox .box::after{content:'✓';color:#fff;font-size:11px;opacity:0}
-.checkbox input:checked+.box::after{opacity:1}
-.btn{padding:12px;border:none;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all .15s;width:100%}
-.btn-primary{background:linear-gradient(135deg,var(--g),var(--gd));color:#fff}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,174,66,.3)}
+.check{display:flex;align-items:center;gap:6px;font-size:10px;cursor:pointer;margin-top:6px}
+.check input{width:14px;height:14px;accent-color:var(--g)}
+.btn{padding:10px;border:none;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;width:100%;margin-bottom:4px}
+.btn-primary{background:var(--g);color:#fff}
 .btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}
-.btn-secondary:hover{border-color:var(--g);color:var(--g)}
-.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.preview-container{background:var(--c);display:flex;align-items:center;justify-content:center;position:relative}
-.preview-box{background:#fff;border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,.5);max-width:90%;max-height:90%;overflow:hidden;display:flex;align-items:center;justify-content:center}
-.preview-box img,.preview-box svg{max-width:100%;max-height:70vh;display:block}
-.preview-placeholder{color:var(--t2);font-size:12px;text-align:center}
-.preview-placeholder .icon{font-size:48px;margin-bottom:12px;opacity:.5}
-.preview-tabs{position:absolute;top:16px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:var(--c);border-radius:20px;padding:4px}
-.preview-tab{padding:6px 16px;border-radius:16px;font-size:10px;font-weight:600;cursor:pointer;transition:all .15s;color:var(--t2)}
-.preview-tab:hover{color:var(--t)}
-.preview-tab.active{background:var(--g);color:#fff}
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.stat{background:var(--c2);border-radius:6px;padding:8px;text-align:center}
-.stat label{font-size:8px;color:var(--t2);text-transform:uppercase}
-.stat .val{font-size:12px;color:var(--g);font-family:monospace;font-weight:600;margin-top:2px}
-.status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}
-.status.error{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}
-.status.success{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--g)}
-.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:10px;border-top:1px solid var(--br)}
-.footer a{color:var(--g);text-decoration:none}
-.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:900px){.app{grid-template-columns:1fr}.panel{display:none}}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.preview-panel{background:#fff;display:flex;align-items:center;justify-content:center;padding:20px}
+.preview-panel img,.preview-panel svg{max-width:100%;max-height:80vh}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.stat{background:var(--c2);border-radius:4px;padding:6px;text-align:center}
+.stat label{font-size:7px;color:var(--t2);text-transform:uppercase}
+.stat .v{font-size:11px;color:var(--g);font-family:monospace}
+.status{padding:6px;border-radius:4px;font-size:9px;display:none;text-align:center}
+.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}
+.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}
+.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}
+.footer a{color:var(--g)}
+.mobile-tabs{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--c);border-top:1px solid var(--br);padding:8px;z-index:100}
+.mobile-tabs .tabs{display:flex;gap:4px}
+.mobile-tabs .tab{flex:1;padding:10px;text-align:center;background:var(--c2);border-radius:6px;font-size:10px;cursor:pointer}
+.mobile-tabs .tab.active{background:var(--g)}
+@media(max-width:800px){
+    .app{display:block;height:auto;padding-bottom:70px}
+    .panel,.preview-panel{display:none;min-height:calc(100vh - 70px)}
+    .panel.active,.preview-panel.active{display:flex}
+    .preview-panel.active{display:flex}
+    .mobile-tabs{display:block}
+}
 </style></head><body>
 <div class="app">
-<div class="panel">
-<a href="/" class="back">← Back to Tools</a>
-<div class="logo">
-<div class="logo-icon">🎨</div>
-<div><h1>Image → SVG</h1><small>VECTORIZE IMAGES</small></div>
-</div>
-<div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
-<div class="upload-icon">📁</div>
-<div class="upload-text"><strong>Drop image here</strong>or click to browse<br>PNG, JPG, WEBP</div>
-</div>
-<input type="file" id="fileInput" accept="image/*">
+<div class="panel active" id="panelSettings">
+<a href="/" class="back">← Back</a>
+<div class="logo"><div class="logo-icon">I</div><div><h1>Image → SVG</h1><small>VECTORIZE IMAGES</small></div></div>
+<div class="upload" id="up" onclick="document.getElementById('file').click()"><p>Drop image here<br>or tap to select</p></div>
+<input type="file" id="file" accept="image/*">
 <div class="sec">
-<div class="sec-title">Trace Mode</div>
+<div class="sec-title">Mode</div>
 <div class="modes">
-<div class="mode active" data-mode="outline" onclick="setMode('outline')"><div class="icon">✏️</div><div class="name">Outline</div></div>
-<div class="mode" data-mode="filled" onclick="setMode('filled')"><div class="icon">⬛</div><div class="name">Filled</div></div>
-<div class="mode" data-mode="threshold" onclick="setMode('threshold')"><div class="icon">🔲</div><div class="name">Threshold</div></div>
-<div class="mode" data-mode="centerline" onclick="setMode('centerline')"><div class="icon">〰️</div><div class="name">Single Line</div></div>
+<div class="mode active" data-m="outline" onclick="setMode('outline')">Outline</div>
+<div class="mode" data-m="filled" onclick="setMode('filled')">Filled</div>
+<div class="mode" data-m="threshold" onclick="setMode('threshold')">Threshold</div>
+<div class="mode" data-m="centerline" onclick="setMode('centerline')">Single Line</div>
 </div>
 </div>
 <div class="sec">
 <div class="sec-title">Settings</div>
-<div class="slider"><div class="slider-head"><label>Threshold</label><span class="val" id="threshV">128</span></div>
-<input type="range" id="thresh" min="10" max="245" value="128" oninput="$('threshV').textContent=this.value"></div>
-<div class="slider"><div class="slider-head"><label>Blur</label><span class="val" id="blurV">1</span></div>
-<input type="range" id="blur" min="0" max="5" value="1" oninput="$('blurV').textContent=this.value"></div>
-<div class="slider"><div class="slider-head"><label>Simplify</label><span class="val" id="simpV">2</span></div>
-<input type="range" id="simp" min="1" max="10" value="2" oninput="$('simpV').textContent=this.value"></div>
-<div class="slider"><div class="slider-head"><label>Smoothing</label><span class="val" id="smoothV">0</span></div>
-<input type="range" id="smooth" min="0" max="10" value="0" oninput="$('smoothV').textContent=this.value"></div>
-<label class="checkbox"><input type="checkbox" id="invert"><span class="box"></span>Invert colors</label>
+<div class="slider"><div class="slider-head"><label>Threshold</label><span class="val" id="thV">128</span></div><input type="range" id="th" min="10" max="245" value="128" oninput="$('thV').textContent=this.value"></div>
+<div class="slider"><div class="slider-head"><label>Blur</label><span class="val" id="blV">1</span></div><input type="range" id="bl" min="0" max="5" value="1" oninput="$('blV').textContent=this.value"></div>
+<div class="slider"><div class="slider-head"><label>Simplify</label><span class="val" id="siV">2</span></div><input type="range" id="si" min="1" max="10" value="2" oninput="$('siV').textContent=this.value"></div>
+<div class="slider"><div class="slider-head"><label>Smooth</label><span class="val" id="smV">0</span></div><input type="range" id="sm" min="0" max="10" value="0" oninput="$('smV').textContent=this.value"></div>
+<label class="check"><input type="checkbox" id="inv"> Invert Colors</label>
 </div>
-<button class="btn btn-secondary" id="btnPreview" onclick="convert()" disabled>👁 Preview</button>
+<button class="btn btn-secondary" id="btnConvert" onclick="convert()" disabled>Convert</button>
 <button class="btn btn-primary" id="btnExport" onclick="exportSVG()" disabled>⬇ Download SVG</button>
 <div class="status" id="status"></div>
-<div class="footer">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
 </div>
-<div class="preview-container" id="previewContainer">
-<div class="preview-tabs">
-<div class="preview-tab active" data-view="svg" onclick="showView('svg')">SVG Result</div>
-<div class="preview-tab" data-view="original" onclick="showView('original')">Original</div>
-</div>
-<div class="preview-placeholder" id="placeholder">
-<div class="icon">🖼️</div>
-Upload an image to start
-</div>
-<div class="preview-box" id="previewBox" style="display:none"></div>
-</div>
-<div class="panel">
+<div class="preview-panel" id="panelPreview"><p style="color:#888">Upload an image</p></div>
+<div class="panel" id="panelInfo">
 <div class="sec-title">Output Info</div>
 <div class="stats">
-<div class="stat"><label>Paths</label><div class="val" id="statPaths">—</div></div>
-<div class="stat"><label>Size</label><div class="val" id="statSize">—</div></div>
-</div>
-<div class="sec" style="margin-top:12px">
-<div class="sec-title">Tips</div>
-<div style="font-size:9px;color:var(--t2);line-height:1.5">
-<strong style="color:var(--g)">Outline:</strong> Edge detection<br>
-<strong style="color:var(--g)">Filled:</strong> Creates silhouettes<br>
-<strong style="color:var(--g)">Threshold:</strong> High contrast B/W<br>
-<strong style="color:var(--g)">Single Line:</strong> One clean line per stroke - perfect for pen plotters!<br><br>
-<strong style="color:var(--g)">Smoothing:</strong> Rounds out curves
+<div class="stat"><label>Paths</label><div class="v" id="stP">-</div></div>
+<div class="stat"><label>Size</label><div class="v" id="stS">-</div></div>
 </div>
 </div>
+</div>
+<div class="mobile-tabs">
+<div class="tabs">
+<div class="tab active" onclick="showPanel('Settings')">Settings</div>
+<div class="tab" onclick="showPanel('Preview')">Preview</div>
+<div class="tab" onclick="showPanel('Info')">Info</div>
 </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let mode='outline',imageData=null,svgResult=null,originalUrl=null;
-const ua=$('uploadArea');
-['dragenter','dragover'].forEach(e=>ua.addEventListener(e,ev=>{ev.preventDefault();ua.classList.add('dragover')}));
-['dragleave','drop'].forEach(e=>ua.addEventListener(e,ev=>{ev.preventDefault();ua.classList.remove('dragover')}));
-ua.addEventListener('drop',e=>{if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])});
-$('fileInput').addEventListener('change',e=>{if(e.target.files.length)handleFile(e.target.files[0])});
-function handleFile(file){
-    if(!file.type.startsWith('image/')){msg('error','Please upload an image');return}
+let mode='outline',imgData=null,svgRes=null;
+const up=$('up');
+up.ondragover=e=>{e.preventDefault();up.style.borderColor='#00AE42'};
+up.ondragleave=()=>up.style.borderColor='#2a2a2a';
+up.ondrop=e=>{e.preventDefault();up.style.borderColor='#2a2a2a';if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])};
+$('file').onchange=e=>{if(e.target.files.length)handleFile(e.target.files[0])};
+
+function handleFile(f){
+    if(!f.type.startsWith('image/')){msg('error','Please upload an image');return}
     const reader=new FileReader();
     reader.onload=e=>{
-        imageData=e.target.result;
-        originalUrl=URL.createObjectURL(file);
-        $('btnPreview').disabled=false;
-        $('placeholder').style.display='none';
-        $('previewBox').style.display='flex';
-        $('previewBox').innerHTML=`<img src="${originalUrl}">`;
-        msg('success','✓ Image loaded: '+file.name);
+        imgData=e.target.result;
+        up.innerHTML='<img src="'+imgData+'">';
+        up.classList.add('has-img');
+        $('btnConvert').disabled=false;
+        $('panelPreview').innerHTML='<img src="'+imgData+'">';
+        msg('success','Image loaded');
     };
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(f);
 }
-function setMode(m){mode=m;document.querySelectorAll('.mode').forEach(el=>el.classList.toggle('active',el.dataset.mode===m))}
-function showView(view){
-    document.querySelectorAll('.preview-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
-    if(view==='original'&&originalUrl)$('previewBox').innerHTML=`<img src="${originalUrl}">`;
-    else if(view==='svg'&&svgResult)$('previewBox').innerHTML=svgResult;
+
+function setMode(m){
+    mode=m;
+    document.querySelectorAll('.mode').forEach(e=>e.classList.toggle('active',e.dataset.m===m));
 }
+
 async function convert(){
-    if(!imageData)return;
-    const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';
+    if(!imgData)return;
+    $('btnConvert').disabled=true;
+    $('btnConvert').textContent='Converting...';
     try{
-        const r=await fetch('/api/image/convert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-            image:imageData,
-            mode,
-            threshold:+$('thresh').value,
-            blur:+$('blur').value,
-            simplify:+$('simp').value,
-            smooth:+$('smooth').value,
-            invert:$('invert').checked,
-            singleLine: mode==='centerline'
-        })});
-        const d=await r.json();if(d.error)throw new Error(d.error);
-        svgResult=d.svg;$('previewBox').innerHTML=svgResult;$('statPaths').textContent=d.paths;$('statSize').textContent=d.width+'×'+d.height;$('btnExport').disabled=false;showView('svg');msg('success','✓ Converted! '+d.paths+' paths');
-    }catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='👁 Preview'}
+        const r=await fetch('/api/image/convert',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                image:imgData,
+                mode,
+                threshold:parseInt($('th').value),
+                blur:parseInt($('bl').value),
+                simplify:parseInt($('si').value),
+                smooth:parseInt($('sm').value),
+                invert:$('inv').checked,
+                singleLine:mode==='centerline'
+            })
+        });
+        const d=await r.json();
+        if(d.error)throw new Error(d.error);
+        svgRes=d.svg;
+        $('panelPreview').innerHTML=svgRes;
+        $('stP').textContent=d.paths;
+        $('stS').textContent=d.width+'x'+d.height;
+        $('btnExport').disabled=false;
+        msg('success','Converted!');
+    }catch(e){
+        msg('error',e.message);
+    }finally{
+        $('btnConvert').disabled=false;
+        $('btnConvert').textContent='Convert';
+    }
 }
-function exportSVG(){if(!svgResult)return;const blob=new Blob([svgResult],{type:'image/svg+xml'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='converted.svg';a.click();msg('success','✓ SVG downloaded!')}
-function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;setTimeout(()=>el.className='status',4000)}
+
+function exportSVG(){
+    if(!svgRes)return;
+    const blob=new Blob([svgRes],{type:'image/svg+xml'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='vectorized.svg';
+    a.click();
+    msg('success','SVG downloaded!');
+}
+
+function showPanel(name){
+    document.querySelectorAll('.panel,.preview-panel').forEach(p=>p.classList.remove('active'));
+    document.querySelectorAll('.mobile-tabs .tab').forEach(t=>t.classList.remove('active'));
+    $('panel'+name).classList.add('active');
+    event.target.classList.add('active');
+}
+
+function msg(type,text){
+    const el=$('status');
+    el.className='status '+type;
+    el.textContent=text;
+    setTimeout(()=>el.className='status',3000);
+}
 </script>
-</body></html>'''
+</body></html>"""
+
+PRINT_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Print to STL | SebGE Tools</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
+body{font-family:system-ui;background:var(--bg);color:var(--t);min-height:100vh}
+.app{display:grid;grid-template-columns:300px 1fr 260px;height:100vh}
+.panel{background:var(--c);padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.panel::-webkit-scrollbar{width:4px}
+.panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:2px}
+.back{color:var(--t2);text-decoration:none;font-size:10px}
+.back:hover{color:var(--g)}
+.logo{display:flex;align-items:center;gap:8px;padding-bottom:8px;border-bottom:1px solid var(--br)}
+.logo-icon{width:32px;height:32px;background:var(--g);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px}
+.logo h1{font-size:13px}
+.logo small{font-size:7px;color:var(--g)}
+.sec{background:var(--c2);border-radius:6px;padding:10px}
+.sec-title{font-size:8px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:600}
+.upload{border:2px dashed var(--br);border-radius:6px;padding:20px 10px;text-align:center;cursor:pointer}
+.upload:hover{border-color:var(--g)}
+.upload p{font-size:10px;color:var(--t2)}
+.upload.has-img{padding:8px}
+.upload img{max-width:100%;max-height:100px;border-radius:4px}
+#file{display:none}
+.color-count{display:flex;gap:4px}
+.cc-btn{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:4px;cursor:pointer;text-align:center;font-size:11px;font-weight:600}
+.cc-btn:hover,.cc-btn.active{border-color:var(--g);background:rgba(0,174,66,.1)}
+.layer-row{display:flex;align-items:center;gap:8px;padding:8px;background:var(--c);border-radius:6px;margin-bottom:6px}
+.layer-row .color-pick{width:36px;height:36px;border-radius:6px;border:2px solid var(--br);cursor:pointer;padding:0;overflow:hidden}
+.layer-row .color-pick::-webkit-color-swatch-wrapper{padding:0}
+.layer-row .color-pick::-webkit-color-swatch{border:none}
+.layer-row .layer-info{flex:1}
+.layer-row .layer-name{font-size:10px;font-weight:600;margin-bottom:2px}
+.layer-row .layer-desc{font-size:8px;color:var(--t2)}
+.layer-row input[type=range]{width:100%;height:4px;background:var(--c2);border-radius:2px;-webkit-appearance:none;margin-top:4px}
+.layer-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--g);border-radius:50%;cursor:pointer}
+.slider{margin-bottom:4px}
+.slider-head{display:flex;justify-content:space-between;margin-bottom:2px}
+.slider label{font-size:9px;color:var(--t2)}
+.slider .val{font-size:9px;color:var(--g);font-family:monospace}
+.slider input[type=range]{width:100%;height:4px;background:var(--c);border-radius:2px;-webkit-appearance:none}
+.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}
+.btn{padding:10px;border:none;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;width:100%}
+.btn-primary{background:var(--g);color:#fff}
+.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.preview-panel{background:var(--c);display:flex;flex-direction:column}
+.preview-header{padding:12px;border-bottom:1px solid var(--br);display:flex;justify-content:space-between;align-items:center}
+.preview-header h2{font-size:12px}
+.preview-header .badge{font-size:8px;background:var(--g);padding:2px 6px;border-radius:8px}
+.preview-area{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;background:#111}
+.preview-area canvas{max-width:100%;max-height:100%;border-radius:6px}
+.instr{background:var(--c2);font-family:monospace;font-size:9px;padding:10px;border-radius:6px;white-space:pre-wrap;max-height:140px;overflow-y:auto;line-height:1.5}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px}
+.stat{background:var(--c2);border-radius:4px;padding:6px;text-align:center}
+.stat label{font-size:7px;color:var(--t2);text-transform:uppercase}
+.stat .v{font-size:11px;color:var(--g);font-family:monospace;font-weight:600}
+.status{padding:6px;border-radius:4px;font-size:9px;display:none;text-align:center}
+.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}
+.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}
+.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}
+.footer a{color:var(--g)}
+.mobile-tabs{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--c);border-top:1px solid var(--br);padding:8px;z-index:100}
+.mobile-tabs .tabs{display:flex;gap:4px}
+.mobile-tabs .tab{flex:1;padding:10px;text-align:center;background:var(--c2);border-radius:6px;font-size:10px;cursor:pointer}
+.mobile-tabs .tab.active{background:var(--g)}
+@media(max-width:900px){
+    .app{display:block;height:auto;padding-bottom:70px}
+    .panel{display:none;min-height:calc(100vh - 70px)}
+    .panel.active{display:flex}
+    .preview-panel{display:none}
+    .preview-panel.active{display:flex;min-height:calc(100vh - 70px)}
+    .mobile-tabs{display:block}
+}
+</style></head><body>
+<div class="app">
+<div class="panel active" id="panelSettings">
+<a href="/" class="back">← Back</a>
+<div class="logo"><div class="logo-icon">P</div><div><h1>Print → STL</h1><small>HUEFORGE STYLE</small></div></div>
+<div class="upload" id="up" onclick="document.getElementById('file').click()"><p>Drop image here<br>or tap to select</p></div>
+<input type="file" id="file" accept="image/*">
+
+<div class="sec">
+<div class="sec-title">Number of Colors</div>
+<div class="color-count">
+<div class="cc-btn active" onclick="setColorCount(2)">2</div>
+<div class="cc-btn" onclick="setColorCount(3)">3</div>
+<div class="cc-btn" onclick="setColorCount(4)">4</div>
+</div>
+</div>
+
+<div class="sec" id="layersSec">
+<div class="sec-title">Layer Colors & Thresholds</div>
+<div id="layerControls"></div>
+</div>
+
+<div class="sec">
+<div class="sec-title">Model Size</div>
+<div class="slider"><div class="slider-head"><label>Width</label><span class="val" id="wV">100mm</span></div><input type="range" id="w" min="60" max="200" value="100" step="5" oninput="$('wV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Total Height</label><span class="val" id="hV">2.4mm</span></div><input type="range" id="h" min="1.6" max="4" value="2.4" step="0.2" oninput="$('hV').textContent=this.value+'mm';updateInstructions()"></div>
+<div class="slider"><div class="slider-head"><label>Base Height</label><span class="val" id="bV">0.6mm</span></div><input type="range" id="b" min="0.4" max="1.2" value="0.6" step="0.1" oninput="$('bV').textContent=this.value+'mm';updateInstructions()"></div>
+<div class="slider"><div class="slider-head"><label>Layer Height</label><span class="val" id="lV">0.12mm</span></div><input type="range" id="l" min="0.08" max="0.2" value="0.12" step="0.02" oninput="$('lV').textContent=this.value+'mm';updateInstructions()"></div>
+</div>
+
+<div class="sec">
+<div class="sec-title">Image Processing</div>
+<div class="slider"><div class="slider-head"><label>Contrast</label><span class="val" id="cV">1.5</span></div><input type="range" id="c" min="1" max="3" value="1.5" step="0.1" oninput="$('cV').textContent=this.value"></div>
+<div class="slider"><div class="slider-head"><label>Denoise</label><span class="val" id="dV">2</span></div><input type="range" id="d" min="0" max="5" value="2" oninput="$('dV').textContent=this.value"></div>
+</div>
+
+<button class="btn btn-secondary" id="btnProcess" onclick="processImage()" disabled>Process Image</button>
+<div class="btn-row">
+<button class="btn btn-primary" id="btnSTL" onclick="exportSTL()" disabled>⬇ STL</button>
+<button class="btn btn-secondary" id="btnPNG" onclick="exportPNG()" disabled>⬇ PNG</button>
+</div>
+<div class="status" id="status"></div>
+</div>
+
+<div class="preview-panel" id="panelPreview">
+<div class="preview-header"><h2>Live Preview</h2><span class="badge" id="badge" style="display:none">Ready</span></div>
+<div class="preview-area"><canvas id="canvas" style="display:none"></canvas><div id="placeholder">Upload an image to see live preview</div></div>
+</div>
+
+<div class="panel" id="panelInfo">
+<div class="sec-title">Print Instructions</div>
+<div class="instr" id="instr">1. Upload image
+2. Choose number of colors
+3. Pick your filament colors
+4. Adjust thresholds with live preview
+5. Export STL and print!</div>
+<div class="sec">
+<div class="sec-title">Model Info</div>
+<div class="stats">
+<div class="stat"><label>Width</label><div class="v" id="stW">-</div></div>
+<div class="stat"><label>Height</label><div class="v" id="stH">-</div></div>
+<div class="stat"><label>Layers</label><div class="v" id="stL">-</div></div>
+</div>
+</div>
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+</div>
+</div>
+
+<div class="mobile-tabs">
+<div class="tabs">
+<div class="tab active" onclick="showPanel('Settings')">Settings</div>
+<div class="tab" onclick="showPanel('Preview')">Preview</div>
+<div class="tab" onclick="showPanel('Info')">Info</div>
+</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let imgData=null,grayData=null,numColors=2;
+
+// Default colors and thresholds for each layer count
+const defaultColors = {
+    2: [{color:'#FFFFFF',name:'Base (white)'},{color:'#222222',name:'Top (black)',thresh:128}],
+    3: [{color:'#FFFFFF',name:'Base (white)'},{color:'#888888',name:'Mid (gray)',thresh:170},{color:'#222222',name:'Top (black)',thresh:85}],
+    4: [{color:'#FFFFFF',name:'Base (white)'},{color:'#BBBBBB',name:'Light gray',thresh:190},{color:'#666666',name:'Dark gray',thresh:120},{color:'#222222',name:'Top (black)',thresh:60}]
+};
+
+let layers = JSON.parse(JSON.stringify(defaultColors[2]));
+
+function renderLayerControls(){
+    const container=$('layerControls');
+    container.innerHTML='';
+    layers.forEach((layer,i)=>{
+        const isBase = i===0;
+        const div=document.createElement('div');
+        div.className='layer-row';
+        div.innerHTML=`
+            <input type="color" class="color-pick" value="${layer.color}" onchange="updateLayerColor(${i},this.value)">
+            <div class="layer-info">
+                <div class="layer-name">Layer ${i+1}${isBase?' (Base)':''}</div>
+                <div class="layer-desc">${isBase?'Bottom layer - thinnest areas':layer.name}</div>
+                ${!isBase?`<input type="range" min="5" max="250" value="${layer.thresh||128}" oninput="updateThreshold(${i},this.value)">`:''}
+            </div>
+        `;
+        container.appendChild(div);
+    });
+}
+
+function updateLayerColor(idx,color){
+    layers[idx].color=color;
+    updateLivePreview();
+    updateInstructions();
+}
+
+function updateThreshold(idx,val){
+    layers[idx].thresh=parseInt(val);
+    updateLivePreview();
+}
+
+function setColorCount(n){
+    numColors=n;
+    document.querySelectorAll('.cc-btn').forEach((b,i)=>b.classList.toggle('active',i===n-2));
+    layers=JSON.parse(JSON.stringify(defaultColors[n]));
+    renderLayerControls();
+    updateLivePreview();
+    updateInstructions();
+}
+
+// File handling
+const up=$('up');
+up.ondragover=e=>{e.preventDefault();up.style.borderColor='#00AE42'};
+up.ondragleave=()=>up.style.borderColor='#2a2a2a';
+up.ondrop=e=>{e.preventDefault();up.style.borderColor='#2a2a2a';if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])};
+$('file').onchange=e=>{if(e.target.files.length)handleFile(e.target.files[0])};
+
+function handleFile(f){
+    if(!f.type.startsWith('image/')){msg('error','Please upload an image');return}
+    const reader=new FileReader();
+    reader.onload=e=>{
+        imgData=e.target.result;
+        up.innerHTML='<img src="'+imgData+'">';
+        up.classList.add('has-img');
+        $('btnProcess').disabled=false;
+        loadImageForPreview(imgData);
+        msg('success','Image loaded');
+    };
+    reader.readAsDataURL(f);
+}
+
+function loadImageForPreview(src){
+    const img=new Image();
+    img.onload=()=>{
+        const canvas=$('canvas');
+        const maxSize=500;
+        let w=img.width,h=img.height;
+        if(w>maxSize||h>maxSize){const s=maxSize/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s)}
+        canvas.width=w;canvas.height=h;
+        const ctx=canvas.getContext('2d');
+        ctx.drawImage(img,0,0,w,h);
+        const imageData=ctx.getImageData(0,0,w,h);
+        grayData=new Uint8Array(w*h);
+        for(let i=0;i<w*h;i++){
+            const r=imageData.data[i*4],g=imageData.data[i*4+1],b=imageData.data[i*4+2];
+            grayData[i]=Math.round(0.299*r+0.587*g+0.114*b);
+        }
+        canvas.style.display='block';
+        $('placeholder').style.display='none';
+        updateLivePreview();
+    };
+    img.src=src;
+}
+
+function hexToRgb(hex){
+    const r=parseInt(hex.slice(1,3),16);
+    const g=parseInt(hex.slice(3,5),16);
+    const b=parseInt(hex.slice(5,7),16);
+    return [r,g,b];
+}
+
+function updateLivePreview(){
+    if(!grayData)return;
+    const canvas=$('canvas');
+    const ctx=canvas.getContext('2d');
+    const w=canvas.width,h=canvas.height;
+    const imageData=ctx.createImageData(w,h);
+    
+    // Sort thresholds descending (brightest first)
+    const sortedLayers=[...layers].map((l,i)=>({...l,idx:i}));
+    // Base layer (0) has no threshold, others sorted by thresh descending
+    const threshLayers=sortedLayers.slice(1).sort((a,b)=>(b.thresh||0)-(a.thresh||0));
+    
+    for(let i=0;i<w*h;i++){
+        const g=grayData[i];
+        let rgb=hexToRgb(layers[0].color); // default to base
+        
+        for(const layer of threshLayers){
+            if(g < (layer.thresh||128)){
+                rgb=hexToRgb(layer.color);
+            }
+        }
+        
+        imageData.data[i*4]=rgb[0];
+        imageData.data[i*4+1]=rgb[1];
+        imageData.data[i*4+2]=rgb[2];
+        imageData.data[i*4+3]=255;
+    }
+    ctx.putImageData(imageData,0,0);
+}
+
+function updateInstructions(){
+    const total=parseFloat($('h').value);
+    const base=parseFloat($('b').value);
+    const layer=parseFloat($('l').value);
+    const totalLayers=Math.round(total/layer);
+    const relief=total-base;
+    
+    $('stL').textContent=totalLayers;
+    
+    let instr=`Layer: ${layer}mm | Total: ${total}mm | ${totalLayers} layers\n\n`;
+    instr+=`1. Start with ${layers[0].color.toUpperCase()}\n`;
+    
+    const threshLayers=layers.slice(1).map((l,i)=>({...l,origIdx:i+1})).sort((a,b)=>(b.thresh||0)-(a.thresh||0));
+    
+    threshLayers.forEach((l,i)=>{
+        const fraction = 1 - ((l.thresh||128)/255);
+        const z = base + relief * fraction;
+        const layerNum = Math.round(z/layer);
+        instr+=`${i+2}. Change to ${l.color.toUpperCase()} at layer ${layerNum} (Z≈${z.toFixed(1)}mm)\n`;
+    });
+    
+    $('instr').textContent=instr;
+}
+
+async function processImage(){
+    if(!imgData)return;
+    $('btnProcess').disabled=true;
+    $('btnProcess').textContent='Processing...';
+    try{
+        const r=await fetch('/api/print/process',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                image:imgData,
+                num_colors:numColors,
+                contrast:parseFloat($('c').value),
+                denoise:parseFloat($('d').value),
+                width:parseFloat($('w').value),
+                total_height:parseFloat($('h').value),
+                base_height:parseFloat($('b').value),
+                layer_height:parseFloat($('l').value),
+                border:2
+            })
+        });
+        const d=await r.json();
+        if(d.error)throw new Error(d.error);
+        $('stW').textContent=d.model_width.toFixed(0)+'mm';
+        $('stH').textContent=d.model_height.toFixed(0)+'mm';
+        $('badge').style.display='inline';
+        $('btnSTL').disabled=false;
+        $('btnPNG').disabled=false;
+        msg('success','Ready to export!');
+    }catch(e){
+        msg('error',e.message);
+    }finally{
+        $('btnProcess').disabled=false;
+        $('btnProcess').textContent='Process Image';
+    }
+}
+
+async function exportSTL(){
+    $('btnSTL').disabled=true;
+    $('btnSTL').textContent='...';
+    try{
+        const r=await fetch('/api/print/stl',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                image:imgData,
+                contrast:parseFloat($('c').value),
+                denoise:parseFloat($('d').value),
+                width:parseFloat($('w').value),
+                total_height:parseFloat($('h').value),
+                base_height:parseFloat($('b').value),
+                border:2
+            })
+        });
+        if(!r.ok)throw new Error('Export failed');
+        const blob=await r.blob();
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download='hueforge_print.stl';
+        a.click();
+        msg('success','STL downloaded!');
+    }catch(e){
+        msg('error',e.message);
+    }finally{
+        $('btnSTL').disabled=false;
+        $('btnSTL').textContent='⬇ STL';
+    }
+}
+
+function exportPNG(){
+    const canvas=$('canvas');
+    if(!canvas||!canvas.width)return;
+    const a=document.createElement('a');
+    a.href=canvas.toDataURL('image/png');
+    a.download='hueforge_preview.png';
+    a.click();
+    msg('success','PNG downloaded!');
+}
+
+function showPanel(name){
+    document.querySelectorAll('.panel,.preview-panel').forEach(p=>p.classList.remove('active'));
+    document.querySelectorAll('.mobile-tabs .tab').forEach(t=>t.classList.remove('active'));
+    $('panel'+name).classList.add('active');
+    event.target.classList.add('active');
+}
+
+function msg(type,text){
+    const el=$('status');
+    el.className='status '+type;
+    el.textContent=text;
+    setTimeout(()=>el.className='status',3000);
+}
+
+// Initialize
+renderLayerControls();
+updateInstructions();
+</script>
+</body></html>"""
 
 MAP_HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Map→STL | SebGE Tools</title>
+<title>Map to STL | SebGE Tools</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}:root{--g:#00AE42;--gd:#009639;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height:100vh;overflow:hidden}.app{display:grid;grid-template-columns:300px 1fr 280px;height:100vh}.panel{background:var(--c);padding:14px;display:flex;flex-direction:column;gap:10px;overflow-y:auto}.panel::-webkit-scrollbar{width:5px}.panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}.back{display:inline-flex;align-items:center;gap:6px;color:var(--t2);text-decoration:none;font-size:10px;margin-bottom:4px}.back:hover{color:var(--g)}.logo{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--br)}.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}.logo h1{font-size:14px;font-weight:700}.logo small{display:block;font-size:8px;color:var(--g);font-weight:500;margin-top:2px}.search{position:relative}.search input{width:100%;padding:8px 10px 8px 30px;background:var(--c2);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:11px}.search input:focus{outline:none;border-color:var(--g)}.search svg{position:absolute;left:8px;top:50%;transform:translateY(-50%);color:var(--t2);width:14px;height:14px}.coords{display:flex;gap:6px;margin-top:4px}.coord{flex:1;background:var(--c2);border-radius:4px;padding:4px 6px;font-size:9px}.coord label{color:var(--t2);font-size:7px;text-transform:uppercase}.coord span{color:var(--g);font-family:monospace;font-weight:600}.sec{background:var(--c2);border-radius:8px;padding:10px}.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--g);margin-bottom:8px}.modes{display:flex;gap:4px}.mode{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;transition:all .15s}.mode:hover{border-color:var(--g)}.mode.active{border-color:var(--g);background:rgba(0,174,66,.1)}.mode .icon{font-size:16px}.mode .name{font-size:8px;font-weight:600;margin-top:2px}.mode .desc{font-size:7px;color:var(--t2)}.presets{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}.preset{padding:4px 8px;background:var(--c);border:1px solid var(--br);border-radius:4px;cursor:pointer;font-size:8px;transition:all .15s}.preset:hover{border-color:var(--g);color:var(--g)}.preset.active{background:var(--g);border-color:var(--g);color:#fff}.street-types{display:grid;grid-template-columns:repeat(2,1fr);gap:3px}.stype{display:flex;align-items:center;gap:4px;padding:4px 6px;background:var(--c);border:1px solid var(--br);border-radius:4px;cursor:pointer;font-size:8px;transition:all .15s}.stype:hover{border-color:var(--g)}.stype.active{border-color:var(--g);background:rgba(0,174,66,.1)}.stype .icon{font-size:10px}.stype .check{width:10px;height:10px;border:1px solid var(--br);border-radius:2px;display:flex;align-items:center;justify-content:center;font-size:7px;margin-left:auto}.stype.active .check{background:var(--g);border-color:var(--g);color:#fff}.markers{display:grid;grid-template-columns:repeat(5,1fr);gap:3px}.marker{padding:5px 2px;background:var(--c);border:2px solid var(--br);border-radius:5px;cursor:pointer;text-align:center;font-size:12px;transition:all .15s}.marker:hover{border-color:var(--g)}.marker.active{border-color:var(--g);background:rgba(0,174,66,.1)}.marker span{display:block;font-size:7px;margin-top:1px}.slider{margin-bottom:5px}.slider-head{display:flex;justify-content:space-between;margin-bottom:2px}.slider label{font-size:9px;color:var(--t2)}.slider .val{font-size:9px;color:var(--g);font-family:monospace;font-weight:600}.slider input{width:100%;height:4px;background:var(--c);border-radius:2px;-webkit-appearance:none}.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--g);border-radius:50%;cursor:pointer}.btn{padding:10px;border:none;border-radius:6px;font-size:10px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;transition:all .15s}.btn-primary{background:linear-gradient(135deg,var(--g),var(--gd));color:#fff}.btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,174,66,.3)}.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}.btn-secondary:hover{border-color:var(--g);color:var(--g)}.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}.status{padding:6px;border-radius:5px;font-size:9px;display:none;text-align:center}.status.error{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}.status.success{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--g)}.map-container{position:relative;background:var(--c)}#map{width:100%;height:100%}.map-overlay{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);padding:5px 12px;border-radius:15px;font-size:8px;color:var(--t2)}.preview-title{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}.preview-title .badge{font-size:7px;background:var(--g);color:#fff;padding:2px 5px;border-radius:8px}#preview3d{flex:1;background:var(--c2);border-radius:8px;min-height:180px;display:flex;align-items:center;justify-content:center;color:var(--t2);font-size:10px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:4px}.stat{background:var(--c2);border-radius:5px;padding:5px;text-align:center}.stat label{font-size:7px;color:var(--t2);text-transform:uppercase}.stat .val{font-size:10px;color:var(--g);font-family:monospace;font-weight:600;margin-top:1px}.info{font-size:8px;color:var(--t2);line-height:1.4;background:var(--c2);border-radius:5px;padding:8px}.info strong{color:var(--g)}.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}.footer a{color:var(--g);text-decoration:none}.spinner{width:12px;height:12px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.marker-opts{margin-top:6px;padding-top:6px;border-top:1px solid var(--br)}.street-sec{display:block}@media(max-width:900px){.app{grid-template-columns:1fr}.panel{display:none}}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--g:#00AE42;--gd:#009639;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
+body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height:100vh;overflow:hidden}
+.app{display:grid;grid-template-columns:300px 1fr 280px;height:100vh}
+.panel{background:var(--c);padding:14px;display:flex;flex-direction:column;gap:10px;overflow-y:auto}
+.panel::-webkit-scrollbar{width:5px}
+.panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}
+.back{display:inline-flex;align-items:center;gap:6px;color:var(--t2);text-decoration:none;font-size:10px;margin-bottom:4px}
+.back:hover{color:var(--g)}
+.logo{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--br)}
+.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--g),var(--gd));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}
+.logo h1{font-size:14px;font-weight:700}
+.logo small{display:block;font-size:8px;color:var(--g);font-weight:500;margin-top:2px}
+.search{position:relative}
+.search input{width:100%;padding:8px 10px 8px 30px;background:var(--c2);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:11px}
+.search input:focus{outline:none;border-color:var(--g)}
+.search svg{position:absolute;left:8px;top:50%;transform:translateY(-50%);color:var(--t2);width:14px;height:14px}
+.coords{display:flex;gap:6px;margin-top:4px}
+.coord{flex:1;background:var(--c2);border-radius:4px;padding:4px 6px;font-size:9px}
+.coord label{color:var(--t2);font-size:7px;text-transform:uppercase}
+.coord span{color:var(--g);font-family:monospace;font-weight:600}
+.sec{background:var(--c2);border-radius:8px;padding:10px}
+.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--g);margin-bottom:8px}
+.modes{display:flex;gap:4px}
+.mode{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;transition:all .15s}
+.mode:hover{border-color:var(--g)}
+.mode.active{border-color:var(--g);background:rgba(0,174,66,.1)}
+.mode .icon{font-size:16px}
+.mode .name{font-size:8px;font-weight:600;margin-top:2px}
+.mode .desc{font-size:7px;color:var(--t2)}
+.presets{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}
+.preset{padding:4px 8px;background:var(--c);border:1px solid var(--br);border-radius:4px;cursor:pointer;font-size:8px;transition:all .15s}
+.preset:hover{border-color:var(--g);color:var(--g)}
+.preset.active{background:var(--g);border-color:var(--g);color:#fff}
+.street-types{display:grid;grid-template-columns:repeat(2,1fr);gap:3px}
+.stype{display:flex;align-items:center;gap:4px;padding:4px 6px;background:var(--c);border:1px solid var(--br);border-radius:4px;cursor:pointer;font-size:8px;transition:all .15s}
+.stype:hover{border-color:var(--g)}
+.stype.active{border-color:var(--g);background:rgba(0,174,66,.1)}
+.stype .icon{font-size:10px}
+.stype .check{width:10px;height:10px;border:1px solid var(--br);border-radius:2px;display:flex;align-items:center;justify-content:center;font-size:7px;margin-left:auto}
+.stype.active .check{background:var(--g);border-color:var(--g);color:#fff}
+.markers{display:grid;grid-template-columns:repeat(5,1fr);gap:3px}
+.marker{padding:5px 2px;background:var(--c);border:2px solid var(--br);border-radius:5px;cursor:pointer;text-align:center;font-size:12px;transition:all .15s}
+.marker:hover{border-color:var(--g)}
+.marker.active{border-color:var(--g);background:rgba(0,174,66,.1)}
+.marker span{display:block;font-size:7px;margin-top:1px}
+.slider{margin-bottom:5px}
+.slider-head{display:flex;justify-content:space-between;margin-bottom:2px}
+.slider label{font-size:9px;color:var(--t2)}
+.slider .val{font-size:9px;color:var(--g);font-family:monospace;font-weight:600}
+.slider input{width:100%;height:4px;background:var(--c);border-radius:2px;-webkit-appearance:none}
+.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--g);border-radius:50%;cursor:pointer}
+.btn{padding:10px;border:none;border-radius:6px;font-size:10px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;transition:all .15s}
+.btn-primary{background:linear-gradient(135deg,var(--g),var(--gd));color:#fff}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,174,66,.3)}
+.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}
+.btn-secondary:hover{border-color:var(--g);color:var(--g)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.status{padding:6px;border-radius:5px;font-size:9px;display:none;text-align:center}
+.status.error{display:block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#ef4444}
+.status.success{display:block;background:rgba(0,174,66,.1);border:1px solid rgba(0,174,66,.3);color:var(--g)}
+.map-container{position:relative;background:var(--c)}
+#map{width:100%;height:100%}
+.map-overlay{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.8);padding:5px 12px;border-radius:15px;font-size:8px;color:var(--t2)}
+.preview-title{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}
+.preview-title .badge{font-size:7px;background:var(--g);color:#fff;padding:2px 5px;border-radius:8px}
+#preview3d{flex:1;background:var(--c2);border-radius:8px;min-height:180px;display:flex;align-items:center;justify-content:center;color:var(--t2);font-size:10px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.stat{background:var(--c2);border-radius:5px;padding:5px;text-align:center}
+.stat label{font-size:7px;color:var(--t2);text-transform:uppercase}
+.stat .val{font-size:10px;color:var(--g);font-family:monospace;font-weight:600;margin-top:1px}
+.info{font-size:8px;color:var(--t2);line-height:1.4;background:var(--c2);border-radius:5px;padding:8px}
+.info strong{color:var(--g)}
+.footer{margin-top:auto;text-align:center;font-size:8px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}
+.footer a{color:var(--g);text-decoration:none}
+.spinner{width:12px;height:12px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.marker-opts{margin-top:6px;padding-top:6px;border-top:1px solid var(--br)}
+.street-sec{display:block}
+@media(max-width:900px){.app{grid-template-columns:1fr}.panel{display:none}}
 </style></head><body>
 <div class="app">
 <div class="panel">
-<a href="/" class="back">← Back to Tools</a>
-<div class="logo"><div class="logo-icon">🗺️</div><div><h1>Map → STL</h1><small>3D PRINT YOUR WORLD</small></div></div>
-<div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="loc" placeholder="Search location..." value="Düsseldorf" onkeypress="if(event.key==='Enter')search()"></div>
-<div class="coords"><div class="coord"><label>LAT</label><br><span id="latV">51.2277</span></div><div class="coord"><label>LON</label><br><span id="lonV">6.7735</span></div></div>
-<div class="sec"><div class="sec-title">Mode</div><div class="modes"><div class="mode active" data-mode="streets" onclick="setMode('streets')"><div class="icon">🛣️</div><div class="name">Streets</div><div class="desc">Roads only</div></div><div class="mode" data-mode="city" onclick="setMode('city')"><div class="icon">🏙️</div><div class="name">City</div><div class="desc">+Buildings</div></div><div class="mode" data-mode="terrain" onclick="setMode('terrain')"><div class="icon">🏔️</div><div class="name">Terrain</div><div class="desc">+Elevation</div></div></div></div>
-<div class="sec street-sec" id="streetSec"><div class="sec-title">Street Types</div><div class="presets"><div class="preset active" onclick="preset('city')">🏙️ City</div><div class="preset" onclick="preset('rural')">🌾 Rural</div><div class="preset" onclick="preset('all')">📍 All</div><div class="preset" onclick="preset('paths')">🚶 Paths</div></div><div class="street-types"><div class="stype active" data-t="motorway"><span class="icon">🚀</span>Highway<span class="check">✓</span></div><div class="stype active" data-t="trunk"><span class="icon">🛣️</span>Trunk<span class="check">✓</span></div><div class="stype active" data-t="primary"><span class="icon">🔴</span>Primary<span class="check">✓</span></div><div class="stype active" data-t="secondary"><span class="icon">🟠</span>Secondary<span class="check">✓</span></div><div class="stype active" data-t="tertiary"><span class="icon">🟡</span>Tertiary<span class="check">✓</span></div><div class="stype active" data-t="residential"><span class="icon">🏠</span>Residential<span class="check">✓</span></div><div class="stype" data-t="unclassified"><span class="icon">📍</span>Unclassified<span class="check">✓</span></div><div class="stype" data-t="service"><span class="icon">🅿️</span>Service<span class="check">✓</span></div><div class="stype" data-t="track"><span class="icon">🌾</span>Field Track<span class="check">✓</span></div><div class="stype" data-t="path"><span class="icon">🥾</span>Path<span class="check">✓</span></div><div class="stype" data-t="footway"><span class="icon">🚶</span>Footway<span class="check">✓</span></div><div class="stype" data-t="cycleway"><span class="icon">🚴</span>Cycleway<span class="check">✓</span></div><div class="stype" data-t="bridleway"><span class="icon">🐴</span>Bridleway<span class="check">✓</span></div><div class="stype" data-t="pedestrian"><span class="icon">🚶‍♂️</span>Pedestrian<span class="check">✓</span></div></div></div>
-<div class="sec street-sec" id="markerSec"><div class="sec-title">Center Marker</div><div class="markers"><div class="marker active" data-m="none" onclick="setMarker('none')">❌<span>None</span></div><div class="marker" data-m="heart" onclick="setMarker('heart')">❤️<span>Heart</span></div><div class="marker" data-m="star" onclick="setMarker('star')">⭐<span>Star</span></div><div class="marker" data-m="pin" onclick="setMarker('pin')">📍<span>Pin</span></div><div class="marker" data-m="circle" onclick="setMarker('circle')">⭕<span>Circle</span></div></div><div class="marker-opts" id="markerOpts" style="display:none"><div class="slider"><div class="slider-head"><label>Marker Size</label><span class="val" id="msV">12mm</span></div><input type="range" id="ms" min="5" max="25" value="12" step="1" oninput="$('msV').textContent=this.value+'mm'"></div><div class="slider"><div class="slider-head"><label>Gap (Frame)</label><span class="val" id="mgV">2mm</span></div><input type="range" id="mg" min="0" max="5" value="2" step="0.5" oninput="$('mgV').textContent=this.value+'mm'"></div></div></div>
-<div class="sec"><div class="sec-title">Settings</div><div class="slider"><div class="slider-head"><label>Radius</label><span class="val" id="radV">500m</span></div><input type="range" id="rad" min="100" max="3000" value="500" step="50" oninput="updRad()"></div><div class="slider"><div class="slider-head"><label>Model Size</label><span class="val" id="sizeV">80mm</span></div><input type="range" id="size" min="30" max="200" value="80" step="5" oninput="$('sizeV').textContent=this.value+'mm'"></div><div class="slider" id="lwSlider"><div class="slider-head"><label>Line Width</label><span class="val" id="lwV">1.2mm</span></div><input type="range" id="lw" min="0.4" max="3" value="1.2" step="0.1" oninput="$('lwV').textContent=this.value+'mm'"></div><div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="htV">2mm</span></div><input type="range" id="ht" min="1" max="10" value="2" step="0.5" oninput="$('htV').textContent=this.value+'mm'"></div></div>
+<a href="/" class="back">Back to Tools</a>
+<div class="logo">
+<div class="logo-icon">M</div>
+<div><h1>Map to STL</h1><small>3D PRINT YOUR WORLD</small></div>
+</div>
+<div class="search">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+<input type="text" id="loc" placeholder="Search location..." value="Dusseldorf" onkeypress="if(event.key==='Enter')search()">
+</div>
+<div class="coords">
+<div class="coord"><label>LAT</label><br><span id="latV">51.2277</span></div>
+<div class="coord"><label>LON</label><br><span id="lonV">6.7735</span></div>
+</div>
+<div class="sec">
+<div class="sec-title">Mode</div>
+<div class="modes">
+<div class="mode active" data-mode="streets" onclick="setMode('streets')"><div class="icon">🛣️</div><div class="name">Streets</div><div class="desc">Roads only</div></div>
+<div class="mode" data-mode="city" onclick="setMode('city')"><div class="icon">🏙️</div><div class="name">City</div><div class="desc">+Buildings</div></div>
+<div class="mode" data-mode="terrain" onclick="setMode('terrain')"><div class="icon">🏔️</div><div class="name">Terrain</div><div class="desc">+Elevation</div></div>
+</div>
+</div>
+<div class="sec street-sec" id="streetSec">
+<div class="sec-title">Street Types</div>
+<div class="presets">
+<div class="preset active" onclick="preset('city')">🏙️ City</div>
+<div class="preset" onclick="preset('rural')">🌾 Rural</div>
+<div class="preset" onclick="preset('all')">📍 All</div>
+<div class="preset" onclick="preset('paths')">🚶 Paths</div>
+</div>
+<div class="street-types">
+<div class="stype active" data-t="motorway"><span class="icon">🚀</span>Highway<span class="check">✓</span></div>
+<div class="stype active" data-t="trunk"><span class="icon">🛣️</span>Trunk<span class="check">✓</span></div>
+<div class="stype active" data-t="primary"><span class="icon">🔴</span>Primary<span class="check">✓</span></div>
+<div class="stype active" data-t="secondary"><span class="icon">🟠</span>Secondary<span class="check">✓</span></div>
+<div class="stype active" data-t="tertiary"><span class="icon">🟡</span>Tertiary<span class="check">✓</span></div>
+<div class="stype active" data-t="residential"><span class="icon">🏠</span>Residential<span class="check">✓</span></div>
+<div class="stype" data-t="unclassified"><span class="icon">📍</span>Unclassified<span class="check">✓</span></div>
+<div class="stype" data-t="service"><span class="icon">🅿️</span>Service<span class="check">✓</span></div>
+<div class="stype" data-t="track"><span class="icon">🌾</span>Field Track<span class="check">✓</span></div>
+<div class="stype" data-t="path"><span class="icon">🥾</span>Path<span class="check">✓</span></div>
+<div class="stype" data-t="footway"><span class="icon">🚶</span>Footway<span class="check">✓</span></div>
+<div class="stype" data-t="cycleway"><span class="icon">🚴</span>Cycleway<span class="check">✓</span></div>
+<div class="stype" data-t="bridleway"><span class="icon">🐴</span>Bridleway<span class="check">✓</span></div>
+<div class="stype" data-t="pedestrian"><span class="icon">🚶‍♂️</span>Pedestrian<span class="check">✓</span></div>
+</div>
+</div>
+<div class="sec street-sec" id="markerSec">
+<div class="sec-title">Center Marker</div>
+<div class="markers">
+<div class="marker active" data-m="none" onclick="setMarker('none')">❌<span>None</span></div>
+<div class="marker" data-m="heart" onclick="setMarker('heart')">❤️<span>Heart</span></div>
+<div class="marker" data-m="star" onclick="setMarker('star')">⭐<span>Star</span></div>
+<div class="marker" data-m="pin" onclick="setMarker('pin')">📍<span>Pin</span></div>
+<div class="marker" data-m="circle" onclick="setMarker('circle')">⭕<span>Circle</span></div>
+</div>
+<div class="marker-opts" id="markerOpts" style="display:none">
+<div class="slider"><div class="slider-head"><label>Marker Size</label><span class="val" id="msV">12mm</span></div>
+<input type="range" id="ms" min="5" max="25" value="12" step="1" oninput="$('msV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Gap (Frame)</label><span class="val" id="mgV">2mm</span></div>
+<input type="range" id="mg" min="0" max="5" value="2" step="0.5" oninput="$('mgV').textContent=this.value+'mm'"></div>
+</div>
+</div>
+<div class="sec">
+<div class="sec-title">Settings</div>
+<div class="slider"><div class="slider-head"><label>Radius</label><span class="val" id="radV">500m</span></div>
+<input type="range" id="rad" min="100" max="3000" value="500" step="50" oninput="updRad()"></div>
+<div class="slider"><div class="slider-head"><label>Model Size</label><span class="val" id="sizeV">80mm</span></div>
+<input type="range" id="size" min="30" max="200" value="80" step="5" oninput="$('sizeV').textContent=this.value+'mm'"></div>
+<div class="slider" id="lwSlider"><div class="slider-head"><label>Line Width</label><span class="val" id="lwV">1.2mm</span></div>
+<input type="range" id="lw" min="0.4" max="3" value="1.2" step="0.1" oninput="$('lwV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="htV">2mm</span></div>
+<input type="range" id="ht" min="1" max="10" value="2" step="0.5" oninput="$('htV').textContent=this.value+'mm'"></div>
+</div>
 </div>
 <div class="map-container"><div id="map"></div><div class="map-overlay">Click map to set center</div></div>
 <div class="panel">
 <div class="preview-title">3D Preview <span class="badge" id="badge" style="display:none">Ready</span></div>
 <div id="preview3d">Click Preview to load</div>
-<div class="stats"><div class="stat"><label>Mode</label><div class="val" id="statMode">Streets</div></div><div class="stat"><label>Data</label><div class="val" id="statData">—</div></div></div>
-<div class="btns"><button class="btn btn-secondary" id="btnPreview" onclick="preview()">👁 Preview</button><button class="btn btn-primary" id="btnExport" onclick="exportSTL()">⬇ Export STL</button></div>
+<div class="stats">
+<div class="stat"><label>Mode</label><div class="val" id="statMode">Streets</div></div>
+<div class="stat"><label>Data</label><div class="val" id="statData">-</div></div>
+</div>
+<div class="btns">
+<button class="btn btn-secondary" id="btnPreview" onclick="preview()">Preview</button>
+<button class="btn btn-primary" id="btnExport" onclick="exportSTL()">Export STL</button>
+</div>
 <div class="status" id="status"></div>
-<div class="info"><strong>🎨 Multi-Color:</strong> Use Gap to separate marker from streets for different colors in Bambu Studio!</div>
-<div class="footer">Made with ❤️ by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+<div class="info"><strong>Multi-Color:</strong> Use Gap to separate marker from streets for different colors in Bambu Studio!</div>
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
 </div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const $=id=>document.getElementById(id);let map,mapMarker,circle,lat=51.2277,lon=6.7735,mode='streets',markerType='none';let scene,camera,renderer,mesh;const presets={city:['motorway','trunk','primary','secondary','tertiary','residential'],rural:['primary','secondary','tertiary','residential','track','unclassified','path','service'],all:['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','track','footway','cycleway','path','pedestrian','bridleway'],paths:['footway','cycleway','path','pedestrian','bridleway','track']};
-function init(){map=L.map('map',{zoomControl:false}).setView([lat,lon],14);L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);updateMap();map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;updateMap();updateCoords()});document.querySelectorAll('.stype').forEach(el=>{el.onclick=()=>{el.classList.toggle('active');document.querySelectorAll('.preset').forEach(p=>p.classList.remove('active'))}});init3D()}
-function init3D(){const container=$('preview3d');scene=new THREE.Scene();scene.background=new THREE.Color(0x1e1e1e);camera=new THREE.PerspectiveCamera(45,container.clientWidth/container.clientHeight,0.1,1000);camera.position.set(80,80,80);camera.lookAt(0,0,0);renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(container.clientWidth,container.clientHeight);scene.add(new THREE.AmbientLight(0xffffff,0.6));const dir=new THREE.DirectionalLight(0xffffff,0.8);dir.position.set(50,100,50);scene.add(dir);const grid=new THREE.GridHelper(100,10,0x333333,0x222222);grid.rotation.x=Math.PI/2;scene.add(grid)}
+const $=id=>document.getElementById(id);
+let map,mapMarker,circle,lat=51.2277,lon=6.7735,mode='streets',markerType='none';
+let scene,camera,renderer,mesh;
+const presets={city:['motorway','trunk','primary','secondary','tertiary','residential'],rural:['primary','secondary','tertiary','residential','track','unclassified','path','service'],all:['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','track','footway','cycleway','path','pedestrian','bridleway'],paths:['footway','cycleway','path','pedestrian','bridleway','track']};
+function init(){
+    map=L.map('map',{zoomControl:false}).setView([lat,lon],14);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
+    updateMap();map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;updateMap();updateCoords()});
+    document.querySelectorAll('.stype').forEach(el=>{el.onclick=()=>{el.classList.toggle('active');document.querySelectorAll('.preset').forEach(p=>p.classList.remove('active'))}});
+    init3D();
+}
+function init3D(){
+    const container=$('preview3d');scene=new THREE.Scene();scene.background=new THREE.Color(0x1e1e1e);
+    camera=new THREE.PerspectiveCamera(45,container.clientWidth/container.clientHeight,0.1,1000);camera.position.set(80,80,80);camera.lookAt(0,0,0);
+    renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(container.clientWidth,container.clientHeight);
+    scene.add(new THREE.AmbientLight(0xffffff,0.6));const dir=new THREE.DirectionalLight(0xffffff,0.8);dir.position.set(50,100,50);scene.add(dir);
+    const grid=new THREE.GridHelper(100,10,0x333333,0x222222);grid.rotation.x=Math.PI/2;scene.add(grid);
+}
 function updateMap(){const r=+$('rad').value;if(mapMarker)map.removeLayer(mapMarker);if(circle)map.removeLayer(circle);mapMarker=L.marker([lat,lon],{icon:L.divIcon({html:'<div style="width:12px;height:12px;background:#00AE42;border:2px solid #fff;border-radius:50%"></div>',iconSize:[12,12],iconAnchor:[6,6]})}).addTo(map);circle=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.05,weight:2}).addTo(map)}
 function updRad(){const r=$('rad').value;$('radV').textContent=r>=1000?(r/1000)+'km':r+'m';if(circle)circle.setRadius(r)}
 function updateCoords(){$('latV').textContent=lat.toFixed(5);$('lonV').textContent=lon.toFixed(5)}
@@ -734,24 +1227,31 @@ function setMode(m){mode=m;document.querySelectorAll('.mode').forEach(el=>el.cla
 function preset(name){const types=presets[name]||[];document.querySelectorAll('.stype').forEach(el=>el.classList.toggle('active',types.includes(el.dataset.t)));document.querySelectorAll('.preset').forEach(p=>p.classList.toggle('active',p.textContent.toLowerCase().includes(name)))}
 function getSelectedTypes(){return Array.from(document.querySelectorAll('.stype.active')).map(el=>el.dataset.t)}
 function setMarker(m){markerType=m;document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('active',el.dataset.m===m));$('markerOpts').style.display=m==='none'?'none':'block'}
-async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);updateMap();updateCoords();msg('success','✓ '+d.name.substring(0,30))}catch(e){msg('error',e.message)}}
-async function preview(){const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});const d=await r.json();if(d.error)throw new Error(d.error);load3DPreview(d.vertices,d.faces);$('statData').textContent=d.count+(mode==='city'?' bldgs':' segs');$('badge').style.display='inline';msg('success','✓ Preview loaded')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='👁 Preview'}}
+async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);updateMap();updateCoords();msg('success',d.name.substring(0,30))}catch(e){msg('error',e.message)}}
+async function preview(){const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});const d=await r.json();if(d.error)throw new Error(d.error);load3DPreview(d.vertices,d.faces);$('statData').textContent=d.count+(mode==='city'?' bldgs':' segs');$('badge').style.display='inline';msg('success','Preview loaded')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='Preview'}}
 function load3DPreview(verts,faces){if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}const geom=new THREE.BufferGeometry();geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));geom.setIndex(faces);geom.computeVertexNormals();const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});mesh=new THREE.Mesh(geom,mat);geom.computeBoundingBox();const box=geom.boundingBox;const center=new THREE.Vector3();box.getCenter(center);mesh.position.sub(center);const maxDim=Math.max(box.max.x-box.min.x,box.max.y-box.min.y,box.max.z-box.min.z);const scale=60/maxDim;mesh.scale.set(scale,scale,scale);scene.add(mesh);const container=$('preview3d');container.innerHTML='';container.appendChild(renderer.domElement);let angle=0;function animate(){requestAnimationFrame(animate);angle+=0.005;camera.position.x=Math.sin(angle)*100;camera.position.z=Math.cos(angle)*100;camera.lookAt(0,0,0);renderer.render(scene,camera)}animate()}
-async function exportSTL(){const btn=$('btnExport');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});if(!r.ok)throw new Error((await r.json()).error);const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`map_${lat.toFixed(4)}_${lon.toFixed(4)}_${mode}.stl`;a.click();msg('success','✓ STL downloaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='⬇ Export STL'}}
+async function exportSTL(){const btn=$('btnExport');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});if(!r.ok)throw new Error((await r.json()).error);const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='map_'+lat.toFixed(4)+'_'+lon.toFixed(4)+'_'+mode+'.stl';a.click();msg('success','STL downloaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='Export STL'}}
 function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;setTimeout(()=>el.className='status',4000)}
 document.addEventListener('DOMContentLoaded',init);
 </script>
 </body></html>'''
 
-# ==================== ROUTES ====================
+# === ROUTES ===
 @app.route('/')
-def landing():return render_template_string(LANDING_HTML)
+def landing():
+    return LANDING
 
 @app.route('/map')
-def map_tool():return render_template_string(MAP_HTML)
+def map_tool():
+    return MAP_HTML
 
 @app.route('/image')
-def image_tool():return render_template_string(IMAGE_HTML)
+def image_tool():
+    return IMAGE_HTML
+
+@app.route('/print')
+def print_tool():
+    return PRINT_HTML
 
 @app.route('/api/geocode')
 def api_geo():
@@ -763,26 +1263,37 @@ def api_geo():
 def api_map_preview():
     try:
         d=request.json;lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
-        mode=d['mode'];lw=d.get('lineWidth',1.2);street_types=d.get('streetTypes',['motorway','trunk','primary','secondary','tertiary','residential'])
-        marker=d.get('marker','none');marker_size=d.get('markerSize',12);marker_gap=d.get('markerGap',2)
-        if mode=='streets':gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,marker_size,marker_gap);count=len(gdf)
+        mode=d['mode'];lw=d.get('lineWidth',1.2)
+        marker=d.get('marker','none');ms=d.get('markerSize',12);mg=d.get('markerGap',2)
+        street_types=d.get('streetTypes',None)
+        if mode=='streets':
+            gdf=fetch_streets(lat,lon,radius,street_types)
+            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,ms,mg)
+            count=len(gdf)
         elif mode=='city':mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5);count=len(fetch_buildings(lat,lon,radius))
-        else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5);count=80*80
+        else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5);count=6400
         return jsonify({'vertices':mesh.vertices.flatten().tolist(),'faces':mesh.faces.flatten().tolist(),'count':count})
-    except Exception as e:return jsonify({'error':str(e)}),500
+    except Exception as e:
+        import traceback;traceback.print_exc()
+        return jsonify({'error':str(e)}),500
 
 @app.route('/api/map/stl',methods=['POST'])
 def api_map_stl():
     try:
         d=request.json;lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
-        mode=d['mode'];lw=d.get('lineWidth',1.2);street_types=d.get('streetTypes',['motorway','trunk','primary','secondary','tertiary','residential'])
-        marker=d.get('marker','none');marker_size=d.get('markerSize',12);marker_gap=d.get('markerGap',2)
-        if mode=='streets':gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,marker_size,marker_gap)
+        mode=d['mode'];lw=d.get('lineWidth',1.2)
+        marker=d.get('marker','none');ms=d.get('markerSize',12);mg=d.get('markerGap',2)
+        street_types=d.get('streetTypes',None)
+        if mode=='streets':
+            gdf=fetch_streets(lat,lon,radius,street_types)
+            mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,ms,mg)
         elif mode=='city':mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
         else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
         mesh.fill_holes();mesh.fix_normals();buf=io.BytesIO();mesh.export(buf,file_type='stl');buf.seek(0)
         return send_file(buf,mimetype='application/octet-stream',as_attachment=True,download_name='map.stl')
-    except Exception as e:return jsonify({'error':str(e)}),500
+    except Exception as e:
+        import traceback;traceback.print_exc()
+        return jsonify({'error':str(e)}),500
 
 @app.route('/api/image/convert',methods=['POST'])
 def api_image_convert():
@@ -790,25 +1301,57 @@ def api_image_convert():
         d=request.json;img_b64=d['image']
         if ',' in img_b64:img_b64=img_b64.split(',')[1]
         img_data=base64.b64decode(img_b64)
-        mode=d.get('mode','outline')
-        threshold=d.get('threshold',128)
-        blur=d.get('blur',1)
-        simplify=d.get('simplify',2)
-        smooth=d.get('smooth',0)
-        invert=d.get('invert',False)
-        single_line=d.get('singleLine',False)
-        
-        if mode=='filled':
-            svg,paths,w,h=image_to_filled_svg(img_data,threshold,blur,simplify,smooth,invert)
-        else:
-            svg,paths,w,h=image_to_svg(img_data,threshold,blur,simplify,smooth,invert,mode,single_line)
-        return jsonify({'svg':svg,'paths':paths,'width':w,'height':h})
-    except Exception as e:return jsonify({'error':str(e)}),500
+        mode=d.get('mode','outline');th=d.get('threshold',128);bl=d.get('blur',1)
+        si=d.get('simplify',2);sm=d.get('smooth',0);inv=d.get('invert',False)
+        sl=d.get('singleLine',False)
+        if mode=='filled':svg,p,w,h=image_to_filled_svg(img_data,th,bl,si,sm,inv)
+        else:svg,p,w,h=image_to_svg(img_data,th,bl,si,sm,inv,mode,sl)
+        return jsonify({'svg':svg,'paths':p,'width':w,'height':h})
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/print/analyze',methods=['POST'])
+def api_print_analyze():
+    try:
+        d=request.json;img_b64=d['image']
+        if ',' in img_b64:img_b64=img_b64.split(',')[1]
+        return jsonify(analyze_print_image(base64.b64decode(img_b64)))
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/print/process',methods=['POST'])
+def api_print_process():
+    try:
+        d=request.json;img_b64=d['image']
+        if ',' in img_b64:img_b64=img_b64.split(',')[1]
+        img_data=base64.b64decode(img_b64)
+        gray=process_print_image(img_data,d.get('contrast',1.5),d.get('denoise',2))
+        preview=create_hueforge_preview(gray,d.get('num_colors',2))
+        instr=calculate_print_instructions(d.get('total_height',2.4),d.get('base_height',0.6),d.get('layer_height',0.12),d.get('num_colors',2))
+        _,mw,mh=create_relief_stl(gray,d.get('width',100),d.get('total_height',2.4),d.get('base_height',0.6),d.get('border',2))
+        buf1=io.BytesIO();Image.fromarray(gray).save(buf1,format='PNG')
+        buf2=io.BytesIO();Image.fromarray(preview).save(buf2,format='PNG')
+        return jsonify({'processed_image':base64.b64encode(buf1.getvalue()).decode(),'preview_image':base64.b64encode(buf2.getvalue()).decode(),'instructions':instr,'model_width':mw,'model_height':mh})
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
+
+@app.route('/api/print/stl',methods=['POST'])
+def api_print_stl():
+    try:
+        d=request.json;img_b64=d['image']
+        if ',' in img_b64:img_b64=img_b64.split(',')[1]
+        gray=process_print_image(base64.b64decode(img_b64),d.get('contrast',1.5),d.get('denoise',2))
+        mesh,_,_=create_relief_stl(gray,d.get('width',100),d.get('total_height',2.4),d.get('base_height',0.6),d.get('border',2))
+        buf=io.BytesIO();mesh.export(buf,file_type='stl');buf.seek(0)
+        return send_file(buf,mimetype='application/octet-stream',as_attachment=True,download_name='print.stl')
+    except Exception as e:
+        return jsonify({'error':str(e)}),500
 
 @app.route('/api/health')
-def health():return jsonify({'status':'ok','version':'1.1','tools':['map','image'],'author':'SebGE'})
+def health():
+    return jsonify({'status':'ok','version':'1.2','tools':['map','image','print']})
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT',8080))
-    print(f"\n  🛠️  SebGE Tools v1.1\n  → http://localhost:{port}\n  Tools: Map→STL, Image→SVG\n")
+    print(f"\n  SebGE Tools v1.2\n  http://localhost:{port}\n")
     app.run(host='0.0.0.0',port=port,debug=os.environ.get('DEBUG','false').lower()=='true')
