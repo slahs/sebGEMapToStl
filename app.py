@@ -1321,7 +1321,25 @@ function getSelectedTypes(){return Array.from(document.querySelectorAll('.stype.
 function setMarker(m){markerType=m;document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('active',el.dataset.m===m));$('markerOpts').style.display=m==='none'?'none':'block'}
 async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);updateMap();updateCoords();msg('success','Found: '+d.name.substring(0,25))}catch(e){msg('error',e.message)}}
 async function preview(){const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});const d=await r.json();if(d.error)throw new Error(d.error);load3DPreview(d.vertices,d.faces);$('statData').textContent=d.count+(mode==='city'?' bldgs':' segs');msg('success','Preview loaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='Preview'}}
-function load3DPreview(verts,faces){if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}const geom=new THREE.BufferGeometry();geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));geom.setIndex(faces);geom.computeVertexNormals();const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});mesh=new THREE.Mesh(geom,mat);geom.computeBoundingBox();const box=geom.boundingBox;const center=new THREE.Vector3();box.getCenter(center);mesh.position.sub(center);const maxDim=Math.max(box.max.x-box.min.x,box.max.y-box.min.y,box.max.z-box.min.z);const scale=60/maxDim;mesh.scale.set(scale,scale,scale);scene.add(mesh);const container=$('preview3d');container.innerHTML='';container.appendChild(renderer.domElement);let angle=0;function animate(){requestAnimationFrame(animate);angle+=0.005;camera.position.x=Math.sin(angle)*100;camera.position.z=Math.cos(angle)*100;camera.lookAt(0,0,0);renderer.render(scene,camera)}animate()}
+function load3DPreview(verts,faces){
+    const container=$('preview3d');
+    const w=container.clientWidth||300;
+    const h=container.clientHeight||250;
+    // Reinitialize renderer with correct size
+    if(!renderer||renderer.domElement.width!==w){
+        scene=new THREE.Scene();scene.background=new THREE.Color(0x1e1e1e);
+        camera=new THREE.PerspectiveCamera(45,w/h,0.1,1000);camera.position.set(80,80,80);camera.lookAt(0,0,0);
+        renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});renderer.setSize(w,h);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+        scene.add(new THREE.AmbientLight(0xffffff,0.6));const dir=new THREE.DirectionalLight(0xffffff,0.8);dir.position.set(50,100,50);scene.add(dir);
+    }
+    if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}
+    const geom=new THREE.BufferGeometry();geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));geom.setIndex(faces);geom.computeVertexNormals();
+    const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});mesh=new THREE.Mesh(geom,mat);
+    geom.computeBoundingBox();const box=geom.boundingBox;const center=new THREE.Vector3();box.getCenter(center);mesh.position.sub(center);
+    const maxDim=Math.max(box.max.x-box.min.x,box.max.y-box.min.y,box.max.z-box.min.z);const scale=60/maxDim;mesh.scale.set(scale,scale,scale);scene.add(mesh);
+    container.innerHTML='';container.appendChild(renderer.domElement);
+    let angle=0;function animate(){requestAnimationFrame(animate);angle+=0.005;camera.position.x=Math.sin(angle)*100;camera.position.z=Math.cos(angle)*100;camera.lookAt(0,0,0);renderer.render(scene,camera)}animate()
+}
 async function exportSTL(){const btn=$('btnExport');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:+$('lw').value,mode,streetTypes:getSelectedTypes(),marker:markerType,markerSize:+$('ms').value,markerGap:+$('mg').value})});if(!r.ok){const err=await r.json();throw new Error(err.error||'Export failed')}const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='map_'+lat.toFixed(4)+'_'+lon.toFixed(4)+'.stl';a.click();msg('success','STL downloaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='⬇ Export STL'}}
 function showPanel(name){
     document.querySelectorAll('.panel,.map-container').forEach(p=>p.classList.remove('active'));
@@ -1329,6 +1347,16 @@ function showPanel(name){
     if(name==='Map'){$('panelMap').classList.add('active');setTimeout(()=>map.invalidateSize(),100)}
     else{$('panel'+name).classList.add('active')}
     event.target.closest('.tab').classList.add('active');
+    // Resize renderer when showing preview panel
+    if(name==='Preview'&&renderer){
+        setTimeout(()=>{
+            const c=$('preview3d');
+            if(c.clientWidth>0&&c.clientHeight>0){
+                camera.aspect=c.clientWidth/c.clientHeight;camera.updateProjectionMatrix();
+                renderer.setSize(c.clientWidth,c.clientHeight);
+            }
+        },150);
+    }
 }
 function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;setTimeout(()=>el.className='status',4000)}
 document.addEventListener('DOMContentLoaded',init);
