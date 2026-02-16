@@ -190,6 +190,222 @@ def create_city_mesh(lat,lon,radius,size,street_h,lw,building_scale,base_h):
     result=trimesh.util.concatenate(meshes);result.fill_holes();result.fix_normals()
     return result
 
+
+# === TERRAIN SAMPLER (for composite) ===
+def create_terrain_mesh_with_sampler(lat,lon,radius,size,height_scale,base_h,res=80):
+    """
+    Returns (terrain_mesh, sampler_fn(x,y)->z) in model coordinates.
+    Model coordinates: x,y in [-size/2, size/2]
+    """
+    elev = fetch_elevation(lat,lon,radius,res)
+    res = elev.shape[0]
+    e_range = elev.max() - elev.min() or 1.0
+    norm = (elev - elev.min())/e_range * float(height_scale)
+
+    step = size/(res-1)
+    half = size/2.0
+
+    # build the same closed terrain mesh as create_terrain_mesh
+    verts=[];faces=[]
+    for i in range(res):
+        for j in range(res):
+            verts.append([-half + j*step, -half + i*step, base_h + norm[i,j]])
+    for i in range(res):
+        for j in range(res):
+            verts.append([-half + j*step, -half + i*step, 0.0])
+
+    n=res;off=res*res
+    for i in range(res-1):
+        for j in range(res-1):
+            v0,v1,v2,v3=i*n+j, i*n+j+1, (i+1)*n+j, (i+1)*n+j+1
+            faces += [[v0,v2,v1],[v1,v2,v3],[off+v0,off+v1,off+v2],[off+v1,off+v3,off+v2]]
+    for j in range(res-1):
+        faces += [[j, j+1, off+j], [j+1, off+j+1, off+j]]
+    for j in range(res-1):
+        t1,t2=(res-1)*n+j, (res-1)*n+j+1
+        b1,b2=off+t1, off+t2
+        faces += [[t1,b1,t2],[t2,b1,b2]]
+    for i in range(res-1):
+        t1,t2=i*n, (i+1)*n
+        b1,b2=off+t1, off+t2
+        faces += [[t1,b1,t2],[t2,b1,b2]]
+    for i in range(res-1):
+        t1,t2=i*n+res-1, (i+1)*n+res-1
+        b1,b2=off+t1, off+t2
+        faces += [[t1,t2,b1],[t2,b2,b1]]
+
+    terrain = trimesh.Trimesh(vertices=verts,faces=faces)
+    terrain.fix_normals()
+
+    def sample_z(x,y):
+        # map x,y -> fractional index into norm grid (i=row=y, j=col=x)
+        fx = (x + half)/step
+        fy = (y + half)/step
+        # clamp within grid
+        if fx < 0: fx = 0.0
+        if fy < 0: fy = 0.0
+        if fx > res-1: fx = float(res-1)
+        if fy > res-1: fy = float(res-1)
+        x0 = int(np.floor(fx)); x1 = min(x0+1, res-1)
+        y0 = int(np.floor(fy)); y1 = min(y0+1, res-1)
+        tx = fx - x0; ty = fy - y0
+
+        z00 = norm[y0,x0]; z10 = norm[y0,x1]
+        z01 = norm[y1,x0]; z11 = norm[y1,x1]
+        z0 = z00*(1-tx) + z10*tx
+        z1 = z01*(1-tx) + z11*tx
+        return float(base_h + (z0*(1-ty) + z1*ty))
+    return terrain, sample_z
+
+def _polygons_from_streets(gdf, lat, lon, radius, size, line_width_mm, street_types=None):
+    gp = gdf.to_crs(gdf.estimate_utm_crs())
+    ctr = gpd.GeoDataFrame(geometry=gpd.points_from_xy([lon],[lat]),crs='EPSG:4326').to_crs(gp.crs).geometry.iloc[0]
+    bb = box(ctr.x-radius, ctr.y-radius, ctr.x+radius, ctr.y+radius)
+    cl = gp.clip(bb)
+    if cl.empty:
+        return None, gp.crs, ctr
+    sc = size/(2*radius)  # model-units per meter
+    buf = (line_width_mm/sc)/2.0
+    uni = unary_union(cl.geometry.buffer(buf, cap_style=2, join_style=2)).simplify(0.15)
+
+    def norm_poly(p):
+        c = np.array(p.exterior.coords)
+        c[:,0] = (c[:,0]-ctr.x)*sc
+        c[:,1] = (c[:,1]-ctr.y)*sc
+        holes=[]
+        for ring in p.interiors:
+            rc = np.array(ring.coords)
+            rc[:,0] = (rc[:,0]-ctr.x)*sc
+            rc[:,1] = (rc[:,1]-ctr.y)*sc
+            holes.append(rc.tolist())
+        return Polygon(c.tolist(), holes)
+
+    polys = [norm_poly(p) for p in (uni.geoms if hasattr(uni,'geoms') else [uni]) if (not p.is_empty)]
+    if not polys:
+        return None, gp.crs, ctr
+    streets = unary_union(polys) if len(polys)>1 else polys[0]
+    return streets, gp.crs, ctr
+
+def _building_polygons(lat, lon, radius, size, utm_crs, ctr_utm, buildings):
+    sc = size/(2*radius)
+    box_clip = box(-size/2, -size/2, size/2, size/2)
+    out=[]
+    for b in buildings:
+        try:
+            bg = gpd.GeoDataFrame(geometry=[b['geometry']], crs='EPSG:4326').to_crs(utm_crs).geometry.iloc[0]
+            if bg.is_empty or not hasattr(bg,'exterior'):
+                continue
+            # quick cull
+            if bg.distance(ctr_utm) > radius*1.2:
+                continue
+            c = np.array(bg.exterior.coords)
+            c[:,0] = (c[:,0]-ctr_utm.x)*sc
+            c[:,1] = (c[:,1]-ctr_utm.y)*sc
+            bp = Polygon(c.tolist()).intersection(box_clip)
+            if bp.is_empty or bp.area < 0.6:
+                continue
+            out.append(bp if bp.geom_type=='Polygon' else list(bp.geoms)[0])
+        except:
+            pass
+    return out
+
+def _drape_mesh_vertices(mesh, sample_z_fn, z_bias=0.0):
+    v = mesh.vertices.copy()
+    # original z range identifies bottom/top
+    zmin = v[:,2].min()
+    zmax = v[:,2].max()
+    # per-vertex base from terrain
+    base = np.array([sample_z_fn(x,y) for x,y,_ in v], dtype=float) + float(z_bias)
+    # keep original extrusion thickness but move to terrain
+    v[:,2] = base + (v[:,2] - zmin)
+    mesh.vertices = v
+    mesh.fix_normals()
+    return mesh
+
+def _place_building(mesh, sample_z_fn, foundation_h, building_h):
+    v = mesh.vertices.copy()
+    zmin = v[:,2].min()
+    zmax = v[:,2].max()
+    base = np.array([sample_z_fn(x,y) for x,y,_ in v], dtype=float)
+
+    # mean base for flat roof target
+    base_mean = float(np.mean(base))
+
+    bottom_mask = np.isclose(v[:,2], zmin)
+    top_mask = np.isclose(v[:,2], zmax)
+
+    # bottom follows terrain + foundation
+    v[bottom_mask,2] = base[bottom_mask] + foundation_h
+    # roof stays flat (relative to mean base)
+    v[top_mask,2] = base_mean + foundation_h + building_h
+
+    # mid vertices (side walls) interpolate by their original z between zmin/zmax
+    mid_mask = ~(bottom_mask | top_mask)
+    if np.any(mid_mask):
+        t = (v[mid_mask,2] - zmin) / (zmax - zmin + 1e-9)
+        v[mid_mask,2] = (base[mid_mask] + foundation_h) * (1-t) + (base_mean + foundation_h + building_h) * t
+
+    mesh.vertices = v
+    mesh.fix_normals()
+    return mesh
+
+def create_composite_mesh(lat, lon, radius, size, road_h, line_width_mm=1.2,
+                          terrain_scale=None, base_h=1.5,
+                          foundation_h=0.8, building_scale=4.0,
+                          street_types=None):
+    """
+    Composite: Terrain + Streets + Buildings, all aligned.
+
+    road_h: height of road emboss/inset in model units (mm)
+    terrain_scale: vertical exaggeration in model units (mm). Default: road_h*5
+    building_scale: multiplies OSM height proxy (10m) before projecting to model units
+    """
+    if terrain_scale is None:
+        terrain_scale = float(road_h) * 5.0
+
+    # Terrain + sampler
+    terrain, sample_z = create_terrain_mesh_with_sampler(lat, lon, radius, size, terrain_scale, base_h, res=80)
+
+    # Streets polygons in model coords
+    gdf = fetch_streets(lat, lon, radius, street_types)
+    streets, utm_crs, ctr_utm = _polygons_from_streets(gdf, lat, lon, radius, size, line_width_mm, street_types)
+    meshes = [terrain]
+
+    if streets:
+        for p in (streets.geoms if hasattr(streets,'geoms') else [streets]):
+            if p.is_empty or p.area < 0.15:
+                continue
+            try:
+                m = trimesh.creation.extrude_polygon(p, float(road_h))
+                # drape roads onto terrain (emboss)
+                m = _drape_mesh_vertices(m, sample_z, z_bias=0.0)
+                meshes.append(m)
+            except:
+                pass
+
+    # Buildings
+    bld = fetch_buildings(lat, lon, radius)
+    b_polys = _building_polygons(lat, lon, radius, size, utm_crs, ctr_utm, bld) if utm_crs else []
+    for bp in b_polys:
+        try:
+            # foundation that touches terrain
+            f = trimesh.creation.extrude_polygon(bp, float(foundation_h))
+            f = _drape_mesh_vertices(f, sample_z, z_bias=0.0)
+            meshes.append(f)
+
+            # building body sitting on top; roof stays flat
+            # OSM proxy: 10m default in fetch_buildings
+            bh_mm = max(10.0 * float(building_scale) * (size/(2*radius)), 1.0)
+            bmesh = trimesh.creation.extrude_polygon(bp, float(bh_mm))
+            bmesh = _place_building(bmesh, sample_z, float(foundation_h), float(bh_mm))
+            meshes.append(bmesh)
+        except:
+            pass
+
+    result = trimesh.util.concatenate(meshes)
+    result.fill_holes()
+    result.fix_normals()
+    return result
 def create_terrain_mesh(lat,lon,radius,size,height_scale,base_h):
     elev=fetch_elevation(lat,lon,radius,80);res=elev.shape[0]
     e_range=elev.max()-elev.min() or 1;norm=(elev-elev.min())/e_range*height_scale
@@ -391,7 +607,7 @@ def calculate_print_instructions(total_height_mm, base_height_mm, layer_height_m
 # === HTML TEMPLATES ===
 
 # === HTML TEMPLATES ===
-LANDING = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+LANDING="""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>SebGE Tools - 3D Print & Design Tools</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -466,6 +682,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#ff
 <span class="tool-icon">🎨</span>
 <h3>Image → SVG</h3>
 <p>Convert images to vector graphics. Perfect for laser cutting, vinyl cutting, or clean scaling.</p>
+
+<a href="/shadow" class="tool">
+<span class="tool-badge vector">SHADOW</span>
+<span class="tool-icon">👪</span>
+<h3>Shadow Maker</h3>
+<p>Turn silhouette PNGs into a perfectly fitting STL with optional base for your shadow box.</p>
+</a>
 </a>
 </div>
 
@@ -1205,6 +1428,7 @@ body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--t);height
 <div class="modes">
 <div class="mode active" data-mode="streets" onclick="setMode('streets')"><div class="icon">🛣️</div><div class="name">Streets</div><div class="desc">Roads only</div></div>
 <div class="mode" data-mode="city" onclick="setMode('city')"><div class="icon">🏙️</div><div class="name">City</div><div class="desc">+Buildings</div></div>
+<div class="mode" data-mode="composite" onclick="setMode('composite')"><div class="icon">🏙️</div><div class="name">Composite</div><div class="desc">Terrain + roads + buildings</div></div>
 <div class="mode" data-mode="terrain" onclick="setMode('terrain')"><div class="icon">🏔️</div><div class="name">Terrain</div><div class="desc">+Elevation</div></div>
 </div>
 </div>
@@ -1397,8 +1621,16 @@ def api_map_preview():
             gdf=fetch_streets(lat,lon,radius,street_types)
             mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,ms,mg)
             count=len(gdf)
-        elif mode=='city':mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5);count=len(fetch_buildings(lat,lon,radius))
-        else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5);count=6400
+        elif mode=='city':
+            mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
+            count=len(fetch_buildings(lat,lon,radius))
+        elif mode=='composite':
+            gdf=fetch_streets(lat,lon,radius,street_types)
+            mesh=create_composite_mesh(lat,lon,radius,size,height,lw,terrain_scale=height*5,base_h=1.5,foundation_h=0.8,building_scale=4.0,street_types=street_types)
+            count=(len(gdf) if hasattr(gdf,'__len__') else 0) + len(fetch_buildings(lat,lon,radius))
+        else:
+            mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
+            count=6400
         return jsonify({'vertices':mesh.vertices.flatten().tolist(),'faces':mesh.faces.flatten().tolist(),'count':count})
     except Exception as e:
         import traceback;traceback.print_exc()
@@ -1414,8 +1646,12 @@ def api_map_stl():
         if mode=='streets':
             gdf=fetch_streets(lat,lon,radius,street_types)
             mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker,ms,mg)
-        elif mode=='city':mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
-        else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
+        elif mode=='city':
+            mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
+        elif mode=='composite':
+            mesh=create_composite_mesh(lat,lon,radius,size,height,lw,terrain_scale=height*5,base_h=1.5,foundation_h=0.8,building_scale=4.0,street_types=street_types)
+        else:
+            mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
         mesh.fill_holes();mesh.fix_normals();buf=io.BytesIO();mesh.export(buf,file_type='stl');buf.seek(0)
         return send_file(buf,mimetype='application/octet-stream',as_attachment=True,download_name='map.stl')
     except Exception as e:
@@ -1476,9 +1712,772 @@ def api_print_stl():
 
 @app.route('/api/health')
 def health():
-    return jsonify({'status':'ok','version':'1.2','tools':['map','image','print']})
+    return jsonify({'status':'ok','version':'1.3','tools':['map','image','print','shadow']})
 
-if __name__=='__main__':
-    port=int(os.environ.get('PORT',8080))
-    print(f"\n  SebGE Tools v1.2\n  http://localhost:{port}\n")
-    app.run(host='0.0.0.0',port=port,debug=os.environ.get('DEBUG','false').lower()=='true')
+# === SHADOW BOX GENERATOR ===
+
+# Simple closed polygon coordinates for family silhouettes (normalized 0-100 height)
+# Each function returns a single list of (x, y) tuples forming a closed polygon
+
+def get_man_silhouette():
+    """Adult man silhouette - simple standing figure"""
+    return [
+        (0, 100), (7, 98), (10, 93), (10, 85), (7, 80),
+        (10, 78), (15, 75), (18, 65), (16, 50),
+        (18, 45), (20, 25), (18, 5), (14, 0),
+        (8, 0), (10, 20), (8, 40), (5, 45),
+        (0, 48),
+        (-5, 45), (-8, 40), (-10, 20), (-8, 0),
+        (-14, 0), (-18, 5), (-20, 25), (-18, 45),
+        (-16, 50), (-18, 65), (-15, 75), (-10, 78),
+        (-7, 80), (-10, 85), (-10, 93), (-7, 98),
+        (0, 100)
+    ]
+
+def get_woman_silhouette():
+    """Adult woman silhouette - with dress shape"""
+    return [
+        (0, 100), (6, 98), (9, 94), (9, 86), (6, 80),
+        (10, 78), (14, 72), (12, 62), (10, 55),
+        (14, 50), (22, 25), (20, 8), (16, 0),
+        (5, 0), (6, 10), (4, 25), (0, 35),
+        (-4, 25), (-6, 10), (-5, 0),
+        (-16, 0), (-20, 8), (-22, 25), (-14, 50),
+        (-10, 55), (-12, 62), (-14, 72), (-10, 78),
+        (-6, 80), (-9, 86), (-9, 94), (-6, 98),
+        (0, 100)
+    ]
+
+def get_boy_silhouette():
+    """Boy silhouette - smaller proportions"""
+    return [
+        (0, 100), (8, 97), (11, 91), (11, 83), (8, 77),
+        (12, 74), (16, 68), (14, 55),
+        (16, 48), (18, 28), (16, 8), (12, 0),
+        (6, 0), (8, 18), (6, 38), (4, 45),
+        (0, 48),
+        (-4, 45), (-6, 38), (-8, 18), (-6, 0),
+        (-12, 0), (-16, 8), (-18, 28), (-16, 48),
+        (-14, 55), (-16, 68), (-12, 74),
+        (-8, 77), (-11, 83), (-11, 91), (-8, 97),
+        (0, 100)
+    ]
+
+def get_girl_silhouette():
+    """Girl silhouette - with dress"""
+    return [
+        (0, 100), (3, 102), (7, 99),
+        (9, 95), (10, 88), (10, 82), (7, 77),
+        (11, 74), (14, 67), (12, 57),
+        (16, 48), (22, 22), (18, 6), (14, 0),
+        (5, 0), (6, 12), (4, 28), (0, 38),
+        (-4, 28), (-6, 12), (-5, 0),
+        (-14, 0), (-18, 6), (-22, 22), (-16, 48),
+        (-12, 57), (-14, 67), (-11, 74),
+        (-7, 77), (-10, 82), (-10, 88), (-9, 95),
+        (-7, 99), (-3, 102), (0, 100)
+    ]
+
+def get_baby_silhouette():
+    """Baby/toddler silhouette - chubby proportions with big head"""
+    return [
+        (0, 100), (10, 96), (14, 88), (14, 76), (10, 68),
+        (14, 62), (18, 50), (20, 30), (18, 12), (14, 0),
+        (6, 0), (8, 15), (6, 35), (0, 45),
+        (-6, 35), (-8, 15), (-6, 0),
+        (-14, 0), (-18, 12), (-20, 30), (-18, 50), (-14, 62),
+        (-10, 68), (-14, 76), (-14, 88), (-10, 96),
+        (0, 100)
+    ]
+
+def get_dog_silhouette():
+    """Dog silhouette - side view standing"""
+    return [
+        (-40, 55), (-38, 65), (-32, 60), (-28, 55), (-20, 52), (-10, 50), (0, 52), (10, 55),
+        (18, 60), (24, 70), (28, 78), (24, 85), (18, 82), (20, 75),
+        (15, 68), (10, 60), (12, 50), (14, 35), (16, 18), (14, 5), (10, 0),
+        (4, 0), (6, 15), (4, 35), (0, 42),
+        (-8, 38), (-12, 20), (-10, 5), (-14, 0),
+        (-22, 0), (-20, 8), (-22, 25), (-24, 40),
+        (-30, 48), (-38, 52), (-40, 55)
+    ]
+
+def get_cat_silhouette():
+    """Cat silhouette - sitting pose with ears"""
+    return [
+        (-8, 100), (-12, 95), (-8, 90),
+        (-4, 92), (0, 90), (4, 92),
+        (8, 90), (12, 95), (8, 100),
+        (10, 88), (12, 80), (10, 70),
+        (14, 60), (16, 45), (18, 25), (16, 10), (12, 0),
+        (5, 0), (6, 15), (4, 35), (0, 45),
+        (-4, 35), (-6, 15), (-5, 0),
+        (-12, 0), (-16, 10), (-18, 25), (-20, 40),
+        (-28, 35), (-32, 45), (-28, 50), (-22, 48),
+        (-18, 52), (-14, 60),
+        (-10, 70), (-12, 80), (-10, 88), (-8, 100)
+    ]
+
+def get_baby_carriage_silhouette():
+    """Baby stroller silhouette"""
+    return [
+        (-20, 50), (-25, 55), (-28, 65), (-25, 75), (-18, 78),
+        (-10, 80), (0, 82), (10, 80), (18, 75),
+        (22, 70), (25, 60), (24, 50),
+        (28, 48), (30, 55), (32, 70), (30, 78), (26, 75), (28, 65), (26, 52),
+        (22, 45), (18, 40), (20, 30), (22, 18),
+        (25, 12), (22, 5), (16, 5), (14, 12), (16, 20), (14, 32),
+        (10, 38), (0, 40), (-10, 38),
+        (-18, 32), (-16, 20), (-18, 12), (-22, 5), (-28, 5), (-30, 12),
+        (-28, 20), (-26, 32), (-24, 42), (-20, 50)
+    ]
+
+SILHOUETTE_GENERATORS = {
+    'man': get_man_silhouette,
+    'woman': get_woman_silhouette,
+    'boy': get_boy_silhouette,
+    'girl': get_girl_silhouette,
+    'baby': get_baby_silhouette,
+    'dog': get_dog_silhouette,
+    'cat': get_cat_silhouette,
+    'baby_carriage': get_baby_carriage_silhouette
+}
+
+DEFAULT_HEIGHTS = {
+    'man': 70, 'woman': 65, 'boy': 50, 'girl': 48,
+    'baby': 35, 'dog': 30, 'cat': 28, 'baby_carriage': 40
+}
+
+def create_silhouette_mesh(figure_type, height_mm, thickness=3):
+    """Create a 3D mesh from a silhouette"""
+    if figure_type not in SILHOUETTE_GENERATORS:
+        print(f"Unknown figure type: {figure_type}")
+        return None
+    
+    points = SILHOUETTE_GENERATORS[figure_type]()
+    
+    if len(points) < 3:
+        return None
+    
+    # Scale to desired height
+    ys = [p[1] for p in points]
+    min_y, max_y = min(ys), max(ys)
+    current_height = max_y - min_y
+    scale = height_mm / current_height if current_height > 0 else 1
+    
+    # Scale and position (bottom at y=0)
+    scaled_points = [(x * scale, (y - min_y) * scale) for x, y in points]
+    
+    try:
+        poly = Polygon(scaled_points)
+        if not poly.is_valid:
+            poly = poly.buffer(0.1)
+        if poly.is_empty or poly.area < 1:
+            poly = Polygon(scaled_points).convex_hull
+        if poly.is_empty:
+            return None
+        
+        mesh = trimesh.creation.extrude_polygon(poly, thickness)
+        print(f"Created {figure_type}: {len(mesh.vertices)} verts")
+        return mesh
+    except Exception as e:
+        print(f"Error creating {figure_type}: {e}")
+        return None
+
+def create_family_mesh(figures, spacing=5, thickness=3, base_height=2, base_padding=10):
+    """Create combined mesh of all family figures on a base"""
+    meshes = []
+    current_x = 0
+    total_width = 0
+    max_height = 0
+    
+    for fig in figures:
+        fig_type = fig.get('type', 'man')
+        height = fig.get('height', DEFAULT_HEIGHTS.get(fig_type, 50))
+        
+        mesh = create_silhouette_mesh(fig_type, height, thickness)
+        if mesh:
+            bounds = mesh.bounds
+            fig_width = bounds[1][0] - bounds[0][0]
+            fig_height = bounds[1][1] - bounds[0][1]
+            
+            center_x = (bounds[0][0] + bounds[1][0]) / 2
+            mesh.apply_translation([-center_x + current_x + fig_width/2, base_height - bounds[0][1], 0])
+            
+            meshes.append(mesh)
+            current_x += fig_width + spacing
+            total_width = current_x - spacing
+            max_height = max(max_height, fig_height)
+    
+    if not meshes:
+        return None, 0, 0
+    
+    base_width = total_width + base_padding * 2
+    base_depth = thickness + base_padding
+    base = trimesh.creation.box([base_width, base_height, base_depth])
+    base.apply_translation([total_width/2, base_height/2, thickness/2])
+    
+    combined = trimesh.util.concatenate([base] + meshes)
+    return combined, total_width + base_padding * 2, max_height + base_height
+
+
+# === SHADOW (Silhouette -> STL for Shadow Box) ===
+def _shadow_extract_geometry(img: Image.Image, height_mm: float, threshold: int, smooth: float,
+                            foot_x: float, foot_y: float, foot_h: float, foot_width: float = 57.969,
+                            cleanup: float = 0.0, max_points: int = 3000):
+    # Extract silhouette polygons (in mm), optionally union with a rectangular foot/base.
+    # Goals:
+    # - Preserve fine details (e.g. braids) by avoiding aggressive morphology + heavy downsampling.
+    # - Keep smoothing gentle and optional.
+    # - Use the same geometry for preview and STL so 2D/3D match the export.
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+
+    arr = np.array(img)
+    alpha, rgb = arr[:, :, 3], arr[:, :, :3]
+    gray = np.mean(rgb, axis=2)
+
+    # If alpha channel exists (transparent background), trust it; otherwise use threshold.
+    if alpha.min() < 250:
+        mask = (alpha > 128) & (gray < threshold)
+    else:
+        mask = gray < threshold
+
+    if not mask.any():
+        raise ValueError("No silhouette found")
+
+    # Optional cleanup (0.0 = off). Use closing (keeps protrusions) instead of opening (kills small details).
+    if cleanup and cleanup > 0:
+        from scipy.ndimage import binary_closing
+        it = int(min(3, max(1, round(cleanup))))
+        mask = binary_closing(mask, iterations=it)
+
+    rows, cols = np.where(mask)
+    img_height = rows.max() - rows.min()
+    img_width = cols.max() - cols.min()
+    if img_height <= 0:
+        raise ValueError("Invalid silhouette height")
+
+    # Scale so silhouette height becomes height_mm
+    scale = float(height_mm) / float(img_height)
+    y_max = rows.max()
+    x_center = (cols.min() + cols.max()) / 2.0
+
+    contours = measure.find_contours(mask.astype(float), 0.5)
+    if not contours:
+        raise ValueError("No contours found")
+
+    # Filter tiny bits (dust). Keep threshold conservative.
+    min_area_px = float(img_height * img_width) * 0.0002
+
+    all_polygons = []
+    for contour in contours:
+        if len(contour) < 20:
+            continue
+
+        # quick area in pixel space
+        n = len(contour)
+        area = 0.5 * abs(sum(contour[i, 0] * contour[(i + 1) % n, 1] - contour[(i + 1) % n, 0] * contour[i, 1] for i in range(n)))
+        if area < min_area_px:
+            continue
+
+        # Light smoothing (moving average) – optional.
+        from scipy.ndimage import uniform_filter1d
+        w = max(3, int(len(contour) * 0.0015 * max(0.0, smooth)))
+        if w > 3:
+            sy = uniform_filter1d(contour[:, 0], size=w, mode="wrap")
+            sx = uniform_filter1d(contour[:, 1], size=w, mode="wrap")
+        else:
+            sy, sx = contour[:, 0], contour[:, 1]
+
+        # Downsample ONLY if huge; otherwise keep details.
+        if len(sy) > max_points:
+            step = max(1, len(sy) // max_points)
+            sy = sy[::step]
+            sx = sx[::step]
+
+        pts = [(float((x - x_center) * scale), float((y_max - y) * scale)) for y, x in zip(sy, sx)]
+        if len(pts) < 3:
+            continue
+
+        poly = Polygon(pts)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        if poly.is_empty or poly.area <= 0.5:
+            continue
+
+        # Optional simplification in mm (tiny by default).
+        tol = float(max(0.0, (smooth - 0.5) * 0.05))  # ~0.0..0.125mm
+        if tol > 0:
+            poly = poly.simplify(tol, preserve_topology=True)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+
+        if not poly.is_empty and poly.area > 0.5:
+            all_polygons.append(poly)
+
+    if not all_polygons:
+        raise ValueError("No valid shapes")
+
+    # Biggest polygon as outer; contained others as holes; remaining as separate islands.
+    all_polygons.sort(key=lambda p: p.area, reverse=True)
+    outer = all_polygons[0]
+    holes = []
+    separate = []
+    for poly in all_polygons[1:]:
+        try:
+            if outer.contains(poly.representative_point()):
+                holes.append(poly)
+            else:
+                separate.append(poly)
+        except Exception:
+            separate.append(poly)
+
+    sil = outer
+    for h in holes:
+        try:
+            sil = sil.difference(h)
+        except Exception:
+            pass
+
+    sil_combined = unary_union([sil] + separate) if separate else sil
+    if not sil_combined.is_valid:
+        sil_combined = sil_combined.buffer(0)
+
+    # Base/foot (optional)
+    combined = sil_combined
+    foot_poly = None
+    if foot_h and foot_h > 0:
+        bounds = sil_combined.bounds
+        sil_bottom = bounds[1]
+        sil_center_x = (bounds[0] + bounds[2]) / 2.0
+
+        foot_bottom = sil_bottom - float(foot_h) + float(foot_y)
+        foot_top = sil_bottom + float(foot_y) + 0.5  # tiny overlap
+        foot_center = sil_center_x + float(foot_x)
+
+        foot_poly = box(foot_center - foot_width / 2.0, foot_bottom, foot_center + foot_width / 2.0, foot_top)
+        combined = unary_union([sil_combined, foot_poly])
+        if not combined.is_valid:
+            combined = combined.buffer(0)
+
+    # Preview rings (mm coords) so 2D preview matches STL exactly.
+    def _rings(g):
+        if g is None or getattr(g, "is_empty", True):
+            return []
+        if g.geom_type == "Polygon":
+            return [[list(map(float, xy)) for xy in g.exterior.coords]]
+        if g.geom_type == "MultiPolygon":
+            return [[[float(x), float(y)] for x, y in p.exterior.coords] for p in g.geoms]
+        return []
+
+    preview_rings = _rings(combined)
+    foot_ring = _rings(foot_poly)[0] if foot_poly is not None and not foot_poly.is_empty else None
+
+    return combined, preview_rings, foot_ring, float(img_width * scale)
+
+
+SHADOW_HTML='''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Family Shadow Generator | SebGE Tools</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
+body{font-family:system-ui;background:var(--bg);color:var(--t);min-height:100vh}
+.app{display:grid;grid-template-columns:340px 1fr;height:100vh}
+.panel{background:var(--c);padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+.panel::-webkit-scrollbar{width:4px}
+.panel::-webkit-scrollbar-thumb{background:var(--br);border-radius:2px}
+.back{color:var(--t2);text-decoration:none;font-size:10px}
+.back:hover{color:var(--g)}
+.logo{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--br)}
+.logo-icon{width:40px;height:40px;background:linear-gradient(135deg,var(--g),#009639);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.logo h1{font-size:15px}
+.logo small{display:block;font-size:8px;color:var(--g)}
+.step{background:var(--c2);border-radius:10px;padding:14px}
+.step-header{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.step-num{width:24px;height:24px;background:var(--g);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700}
+.step-title{font-size:12px;font-weight:600}
+.step p{font-size:10px;color:var(--t2);line-height:1.5;margin-bottom:10px}
+.gpt-btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:12px;background:linear-gradient(135deg,#10a37f,#1a7f64);color:#fff;text-decoration:none;border-radius:8px;font-size:12px;font-weight:600;transition:all .2s}
+.gpt-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(16,163,127,.3)}
+.gpt-btn svg{width:18px;height:18px}
+.upload{border:2px dashed var(--br);border-radius:10px;padding:20px 15px;text-align:center;cursor:pointer;transition:all .2s}
+.upload:hover{border-color:var(--g);background:rgba(0,174,66,.05)}
+.upload.has-image{padding:8px;border-style:solid;border-color:var(--g)}
+.upload img{max-width:100%;max-height:100px;border-radius:6px}
+.upload p{font-size:11px;color:var(--t2)}
+.upload .icon{font-size:28px;margin-bottom:6px}
+#file{display:none}
+.settings{display:none}
+.settings.visible{display:block}
+.slider{margin-bottom:6px}
+.slider-head{display:flex;justify-content:space-between;margin-bottom:3px}
+.slider label{font-size:10px;color:var(--t2)}
+.slider .val{font-size:10px;color:var(--g);font-family:monospace}
+.slider input{width:100%;height:5px;background:var(--c);border-radius:3px;-webkit-appearance:none}
+.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}
+.btn{padding:12px;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;width:100%;transition:all .2s}
+.btn-primary{background:var(--g);color:#fff}
+.btn-primary:hover{background:#00c94b}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.preview-panel{background:#1a1a1a;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+.preview-container{position:relative;display:flex;align-items:center;justify-content:center;width:100%;height:100%}
+#previewCanvas{display:none}
+.preview3d-container{display:flex;align-items:center;justify-content:center;width:100%;height:100%}
+#preview3d{width:100%;height:100%}
+.view-toggle{display:none}
+.view-btn{display:none}
+.stats{display:flex;gap:8px;margin-bottom:8px}
+.stat{background:var(--c2);border-radius:6px;padding:8px 12px;text-align:center;flex:1}
+.stat label{font-size:8px;color:var(--t2);text-transform:uppercase}
+.stat .val{font-size:13px;color:var(--g);font-family:monospace;font-weight:600}
+.status{padding:10px;border-radius:6px;font-size:11px;display:none;text-align:center;margin-top:8px}
+.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}
+.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}
+.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:10px;border-top:1px solid var(--br)}
+.footer a{color:var(--g);text-decoration:none}
+.divider{border:none;border-top:1px solid var(--br);margin:4px 0}
+.section-label{font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;font-weight:600}
+.foot-info{font-size:9px;color:var(--t2);margin-bottom:8px}
+.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:900px){.app{display:block}.panel,.preview-panel{min-height:50vh}}
+</style></head><body>
+<div class="app">
+<div class="panel active" id="panelSettings">
+<a href="/" class="back">← Back to Tools</a>
+<div class="logo"><div class="logo-icon">👨‍👩‍👧</div><div><h1>Family Shadow</h1><small>SILHOUETTE TO STL</small></div></div>
+<div class="step">
+<div class="step-header"><div class="step-num">1</div><div class="step-title">Create Your Silhouette</div></div>
+<p>Use our AI to generate a family silhouette.</p>
+<a href="https://chatgpt.com/g/g-699077b0e53c8191a6cfbb033250c030-family-silhouette-cutter" target="_blank" class="gpt-btn">
+<svg viewBox="0 0 24 24" fill="currentColor"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729z"/></svg>
+Open Silhouette Creator</a>
+</div>
+<div class="step">
+<div class="step-header"><div class="step-num">2</div><div class="step-title">Upload Image</div></div>
+<div class="upload" id="upload" onclick="document.getElementById('file').click()"><div class="icon">📤</div><p>Drop PNG here or click</p></div>
+<input type="file" id="file" accept="image/png,image/jpeg,image/webp">
+</div>
+<div class="step settings" id="settingsPanel">
+<div class="step-header"><div class="step-num">3</div><div class="step-title">Settings</div></div>
+<div class="section-label">Silhouette</div>
+<div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="heightV">140mm</span></div><input type="range" id="height" min="80" max="170" value="140" oninput="updateSettings()"></div>
+<div class="slider"><div class="slider-head"><label>Thickness</label><span class="val" id="thicknessV">2mm</span></div><input type="range" id="thickness" min="1.5" max="4" value="2" step="0.5" oninput="updateSettings()"></div>
+<hr class="divider">
+<div class="section-label">Mounting Foot (58mm fixed width)</div>
+<div class="foot-info">Adjust position to connect all parts</div>
+<div class="slider"><div class="slider-head"><label>↕ Vertical</label><span class="val" id="footYV">0mm</span></div><input type="range" id="footY" min="0" max="40" value="0" oninput="updateSettings()"></div>
+<div class="slider"><div class="slider-head"><label>↔ Horizontal</label><span class="val" id="footXV">0mm</span></div><input type="range" id="footX" min="-40" max="40" value="0" oninput="updateSettings()"></div>
+<div class="slider"><div class="slider-head"><label>Foot Height</label><span class="val" id="footHV">4mm</span></div><input type="range" id="footH" min="0" max="20" value="4" oninput="updateSettings()"></div>
+<hr class="divider">
+<div class="section-label">Image Processing</div>
+<div class="slider"><div class="slider-head"><label>Smoothness</label><span class="val" id="smoothV">1.0</span></div><input type="range" id="smooth" min="0.0" max="3" value="0.8" step="0.1" oninput="updateSettings()">
+<div class="slider"><div class="slider-head"><label>Cleanup</label><span class="val" id="cleanupV">0</span></div><input type="range" id="cleanup" min="0" max="3" value="0" step="1" oninput="updateSettings()"></div>
+<div class="slider"><div class="slider-head"><label>Detail (Points)</label><span class="val" id="maxPointsV">3000</span></div><input type="range" id="maxPoints" min="800" max="8000" value="3000" step="100" oninput="updateSettings()"></div>
+</div>
+<div class="slider"><div class="slider-head"><label>Threshold</label><span class="val" id="thresholdV">128</span></div><input type="range" id="threshold" min="10" max="245" value="128" oninput="updateSettings()"></div>
+</div>
+<div class="stats"><div class="stat"><label>Width</label><div class="val" id="statWidth">-</div></div><div class="stat"><label>Height</label><div class="val" id="statHeight">-</div></div></div>
+<button class="btn btn-primary" onclick="exportSTL()" id="btnExport" disabled>⬇ Download STL</button>
+<div class="status" id="status"></div>
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+</div>
+<div class="preview-panel" id="panelPreview">
+<div class="preview-container">
+<canvas id="previewCanvas"></canvas>
+<div class="preview3d-container" id="preview3dContainer"><canvas id="preview3d"></canvas></div>
+</div>
+</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+// previewData is filled by /api/shadow/process; keep it global so drawPreview() can render the exact polygons.
+let previewData=null;
+let imageData=null,originalImage=null,scene,camera,renderer,mesh,currentView='3d',processTimeout=null;
+const canvas=$('previewCanvas'),ctx=canvas.getContext('2d');
+const upload=$('upload');
+upload.ondragover=e=>{e.preventDefault();upload.style.borderColor='#00AE42'};
+upload.ondragleave=()=>upload.style.borderColor='#2a2a2a';
+upload.ondrop=e=>{e.preventDefault();upload.style.borderColor='#2a2a2a';if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])};
+$('file').onchange=e=>{if(e.target.files.length)handleFile(e.target.files[0])};
+function handleFile(file){
+    if(!file.type.startsWith('image/')){msg('error','Please upload an image');return}
+    const reader=new FileReader();
+    reader.onload=e=>{
+        imageData=e.target.result;
+        previewData=null; // reset until backend responds
+        originalImage=new Image();
+        originalImage.onload=()=>{
+            upload.innerHTML='<img src="'+imageData+'">';
+            upload.classList.add('has-image');
+            $('settingsPanel').classList.add('visible');
+            // Don't call drawPreview() yet (needs previewData). We'll render as soon as the backend returns polygons.
+            try{ctx.clearRect(0,0,canvas.width,canvas.height);}catch(e){}
+            processImage();
+        };
+        originalImage.src=imageData;
+    };
+    reader.readAsDataURL(file);
+}
+function drawPreview(){
+    // 2D preview intentionally disabled (3D-only UX)
+    return;
+}
+function updateSettings(){
+    $('heightV').textContent=$('height').value+'mm';
+    $('thicknessV').textContent=$('thickness').value+'mm';
+    $('footYV').textContent=$('footY').value+'mm up';
+    $('footXV').textContent=($('footX').value>=0?'+':'')+$('footX').value+'mm';
+    $('footHV').textContent=$('footH').value+'mm';
+    $('smoothV').textContent=parseFloat($('smooth').value).toFixed(1);
+    $('cleanupV').textContent=$('cleanup').value;
+    $('maxPointsV').textContent=$('maxPoints').value;
+    $('thresholdV').textContent=$('threshold').value;
+    drawPreview();
+    if(processTimeout)clearTimeout(processTimeout);
+    if(imageData)processTimeout=setTimeout(processImage,400);
+}
+async function processImage(){
+    if(!imageData)return;msg('success','Processing...');
+    try{
+        const r=await fetch('/api/shadow/process',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({image:imageData,height:parseFloat($('height').value),thickness:parseFloat($('thickness').value),
+                threshold:parseInt($('threshold').value),smooth:parseFloat($('smooth').value),
+                footX:parseFloat($('footX').value),footY:parseFloat($('footY').value),footH:parseFloat($('footH').value),cleanup:parseFloat($('cleanup').value),maxPoints:parseInt($('maxPoints').value)})});
+        const d=await r.json();if(d.error)throw new Error(d.error);
+        $('statWidth').textContent=d.width.toFixed(0)+'mm';$('statHeight').textContent=d.height.toFixed(0)+'mm';
+        $('btnExport').disabled=false;
+        previewData=d.preview||null;drawPreview();
+        if(d.vertices&&d.faces){init3D();loadPreview(d.vertices,d.faces)}
+        msg('success','Ready!');
+    }catch(e){msg('error',e.message)}
+}
+function init3D(){
+    if(renderer)return;const container=$('preview3d');
+    scene=new THREE.Scene();scene.background=new THREE.Color(0xf0f0f0);
+    camera=new THREE.PerspectiveCamera(45,1,0.1,1000);camera.position.set(0,100,250);
+    renderer=new THREE.WebGLRenderer({canvas:container,antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    // Fit renderer to container
+    const wrap=$('preview3dContainer');
+    camera.aspect=wrap.clientWidth/wrap.clientHeight;camera.updateProjectionMatrix();
+    renderer.setSize(wrap.clientWidth,wrap.clientHeight);
+    scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
+    const dir=new THREE.DirectionalLight(0xffffff,0.9);dir.position.set(80,140,90);scene.add(dir);
+    setupDragOrbit();
+    animate();
+}
+
+// --- Drag-to-rotate orbit camera (no auto-rotate) ---
+let orbit={theta:0.8,phi:1.15,radius:260,target:new THREE.Vector3(0,70,0),drag:false,lastX:0,lastY:0};
+function clamp(v,min,max){return Math.max(min,Math.min(max,v));}
+function updateCamera(){
+    const t=orbit.target;
+    const sinPhi=Math.sin(orbit.phi);
+    camera.position.x = t.x + orbit.radius * sinPhi * Math.sin(orbit.theta);
+    camera.position.z = t.z + orbit.radius * sinPhi * Math.cos(orbit.theta);
+    camera.position.y = t.y + orbit.radius * Math.cos(orbit.phi);
+    camera.lookAt(t);
+}
+function setupDragOrbit(){
+    const c=$('preview3d');
+    updateCamera();
+    c.style.cursor='grab';
+
+    c.addEventListener('pointerdown',e=>{
+        orbit.drag=true;orbit.lastX=e.clientX;orbit.lastY=e.clientY;
+        c.setPointerCapture(e.pointerId);
+        c.style.cursor='grabbing';
+    });
+    c.addEventListener('pointermove',e=>{
+        if(!orbit.drag)return;
+        const dx=e.clientX-orbit.lastX;
+        const dy=e.clientY-orbit.lastY;
+        orbit.lastX=e.clientX;orbit.lastY=e.clientY;
+        orbit.theta -= dx*0.006;
+        orbit.phi = clamp(orbit.phi - dy*0.006, 0.25, Math.PI-0.25);
+        updateCamera();
+    });
+    c.addEventListener('pointerup',()=>{orbit.drag=false;c.style.cursor='grab';});
+    c.addEventListener('pointercancel',()=>{orbit.drag=false;c.style.cursor='grab';});
+
+    // Optional zoom with wheel
+    c.addEventListener('wheel',e=>{
+        e.preventDefault();
+        orbit.radius = clamp(orbit.radius + e.deltaY*0.2, 120, 600);
+        updateCamera();
+    },{passive:false});
+}
+
+function animate(){
+    requestAnimationFrame(animate);
+    if(renderer){
+        renderer.render(scene,camera);
+    }
+}
+function loadPreview(verts,faces){
+    if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}
+    const geom=new THREE.BufferGeometry();geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+    geom.setIndex(faces);geom.computeVertexNormals();
+    mesh=new THREE.Mesh(geom,new THREE.MeshPhongMaterial({color:0x1a1a1a,flatShading:false,shininess:30}));
+    geom.computeBoundingBox();const center=new THREE.Vector3();geom.boundingBox.getCenter(center);
+    mesh.position.set(-center.x,0,-center.z);scene.add(mesh);
+}
+function setView(view){
+    // view toggle removed (3D-only)
+}
+async function exportSTL(){
+    if(!imageData)return;$('btnExport').disabled=true;$('btnExport').innerHTML='<span class="spinner"></span> Exporting...';
+    try{
+        const r=await fetch('/api/shadow/stl',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({image:imageData,height:parseFloat($('height').value),thickness:parseFloat($('thickness').value),
+                threshold:parseInt($('threshold').value),smooth:parseFloat($('smooth').value),
+                footX:parseFloat($('footX').value),footY:parseFloat($('footY').value),footH:parseFloat($('footH').value),cleanup:parseFloat($('cleanup').value),maxPoints:parseInt($('maxPoints').value)})});
+        if(!r.ok)throw new Error('Export failed');
+        const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='family_silhouette.stl';a.click();
+        msg('success','Downloaded!');
+    }catch(e){msg('error',e.message)}finally{$('btnExport').disabled=false;$('btnExport').innerHTML='⬇ Download STL'}
+}
+function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;if(type==='success')setTimeout(()=>el.className='status',2000)}
+window.addEventListener('resize',()=>{
+    if(renderer){
+        const c=$('preview3dContainer');
+        camera.aspect=c.clientWidth/c.clientHeight;camera.updateProjectionMatrix();
+        renderer.setSize(c.clientWidth,c.clientHeight);
+        updateCamera();
+    }
+});
+</script>
+</body></html>'''
+
+@app.route('/shadow')
+def shadow_tool():
+    return SHADOW_HTML
+
+
+@app.route('/api/shadow/process', methods=['POST'])
+def api_shadow_process():
+    try:
+        d = request.json or {}
+        img_data = d.get('image', '')
+        height_mm = float(d.get('height', 140))
+        thickness = float(d.get('thickness', 2))
+        threshold = int(d.get('threshold', 128))
+        smooth = float(d.get('smooth', 0.8))
+        cleanup = float(d.get('cleanup', 0.0))
+        max_points = int(d.get('maxPoints', 3000))
+
+        foot_x = float(d.get('footX', 0))
+        foot_y = float(d.get('footY', 0))
+        foot_h = float(d.get('footH', 4))  # set to 0 to disable
+        foot_width = 57.969  # fixed width to match your shadow box
+
+        if ',' in img_data:
+            img_data = img_data.split(',')[1]
+        img_bytes = base64.b64decode(img_data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        combined, preview_rings, foot_ring, width_mm = _shadow_extract_geometry(
+            img=img,
+            height_mm=height_mm,
+            threshold=threshold,
+            smooth=smooth,
+            foot_x=foot_x,
+            foot_y=foot_y,
+            foot_h=foot_h,
+            foot_width=foot_width,
+            cleanup=cleanup,
+            max_points=max_points
+        )
+
+        # Build mesh for 3D preview (same geometry!)
+        meshes = []
+        polys = list(combined.geoms) if combined.geom_type == 'MultiPolygon' else [combined]
+        for p in polys:
+            try:
+                meshes.append(trimesh.creation.extrude_polygon(p, thickness))
+            except Exception:
+                pass
+        if not meshes:
+            return jsonify({'error': 'Mesh creation failed'}), 400
+
+        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+
+        # Height stat: silhouette height + optional foot height
+        height_out = float(height_mm + (foot_h if foot_h and foot_h > 0 else 0))
+
+        return jsonify({
+            'vertices': mesh.vertices.flatten().tolist(),
+            'faces': mesh.faces.flatten().tolist(),
+            'width': width_mm,
+            'height': height_out,
+            'preview': {
+                'rings': preview_rings,
+                'foot': foot_ring
+            }
+        })
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/shadow/stl', methods=['POST'])
+def api_shadow_stl():
+    try:
+        d = request.json or {}
+        img_data = d.get('image', '')
+        height_mm = float(d.get('height', 140))
+        thickness = float(d.get('thickness', 2))
+        threshold = int(d.get('threshold', 128))
+        smooth = float(d.get('smooth', 0.8))
+        cleanup = float(d.get('cleanup', 0.0))
+        max_points = int(d.get('maxPoints', 3000))
+
+        foot_x = float(d.get('footX', 0))
+        foot_y = float(d.get('footY', 0))
+        foot_h = float(d.get('footH', 4))  # set to 0 to disable
+        foot_width = 57.969  # fixed width
+
+        if ',' in img_data:
+            img_data = img_data.split(',')[1]
+        img_bytes = base64.b64decode(img_data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        combined, _, _, _ = _shadow_extract_geometry(
+            img=img,
+            height_mm=height_mm,
+            threshold=threshold,
+            smooth=smooth,
+            foot_x=foot_x,
+            foot_y=foot_y,
+            foot_h=foot_h,
+            foot_width=foot_width,
+            cleanup=cleanup,
+            max_points=max_points
+        )
+
+        meshes = []
+        polys = list(combined.geoms) if combined.geom_type == 'MultiPolygon' else [combined]
+        for p in polys:
+            try:
+                meshes.append(trimesh.creation.extrude_polygon(p, thickness))
+            except Exception:
+                pass
+        if not meshes:
+            return jsonify({'error': 'Mesh failed'}), 400
+
+        mesh = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+        mesh.fix_normals()
+
+        buf = io.BytesIO()
+        mesh.export(buf, file_type='stl')
+        buf.seek(0)
+        return send_file(buf, mimetype='application/octet-stream', as_attachment=True, download_name='family_silhouette.stl')
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
