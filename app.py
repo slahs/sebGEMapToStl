@@ -166,6 +166,47 @@ def create_city_mesh(lat,lon,radius,size,street_h,lw,building_scale,base_h):
     result=trimesh.util.concatenate(meshes);result.fill_holes();result.fix_normals()
     return result
 
+def create_city_mesh_with_marker(gdf,lat,lon,radius,size,street_h,lw,building_scale,base_h,marker_type='none',marker_size=10,marker_gap=0):
+    buildings=fetch_buildings(lat,lon,radius)
+    gp=gdf.to_crs(gdf.estimate_utm_crs());utm=gp.crs
+    ctr=gpd.GeoDataFrame(geometry=gpd.points_from_xy([lon],[lat]),crs='EPSG:4326').to_crs(utm).geometry.iloc[0]
+    sc=size/(2*radius);meshes=[trimesh.creation.extrude_polygon(box(-size/2,-size/2,size/2,size/2),base_h)]
+    bb=box(ctr.x-radius,ctr.y-radius,ctr.x+radius,ctr.y+radius);cl=gp.clip(bb)
+    marker_poly=gap_poly=None
+    if marker_type!='none' and marker_type in MARKERS and MARKERS[marker_type]:
+        marker_poly=MARKERS[marker_type](marker_size)
+        if marker_gap>0:gap_poly=marker_poly.buffer(marker_gap)
+    if not cl.empty:
+        uni=unary_union(cl.geometry.buffer(lw/sc,cap_style=2)).simplify(0.3)
+        for p in(uni.geoms if hasattr(uni,'geoms')else[uni]):
+            if p.is_empty or p.area<1:continue
+            c=np.array(p.exterior.coords);c[:,0]=(c[:,0]-ctr.x)*sc;c[:,1]=(c[:,1]-ctr.y)*sc
+            poly=Polygon(c.tolist())
+            if gap_poly:poly=poly.difference(gap_poly)
+            for pp in(poly.geoms if hasattr(poly,'geoms')else[poly]):
+                if pp.is_empty or pp.area<0.5:continue
+                try:m=trimesh.creation.extrude_polygon(pp,street_h);m.vertices[:,2]+=base_h;meshes.append(m)
+                except:pass
+    for b in buildings:
+        try:
+            bg=gpd.GeoDataFrame(geometry=[b['geometry']],crs='EPSG:4326').to_crs(utm).geometry.iloc[0]
+            if bg.distance(ctr)>radius*1.2:continue
+            c=np.array(bg.exterior.coords);c[:,0]=(c[:,0]-ctr.x)*sc;c[:,1]=(c[:,1]-ctr.y)*sc
+            bp=Polygon(c.tolist()).intersection(box(-size/2,-size/2,size/2,size/2))
+            if gap_poly:bp=bp.difference(gap_poly)
+            if bp.is_empty or bp.area<0.5:continue
+            bh=max(b['height']*building_scale*sc,0.5)
+            for bpp in(bp.geoms if hasattr(bp,'geoms')else[bp]):
+                if bpp.is_empty or bpp.area<0.3 or bpp.geom_type!='Polygon':continue
+                m=trimesh.creation.extrude_polygon(bpp,bh)
+                m.vertices[:,2]+=base_h+street_h;meshes.append(m)
+        except:pass
+    if marker_poly:
+        try:m=trimesh.creation.extrude_polygon(marker_poly,street_h);m.vertices[:,2]+=base_h;meshes.append(m)
+        except:pass
+    result=trimesh.util.concatenate(meshes);result.fill_holes();result.fix_normals()
+    return result
+
 def create_terrain_mesh(lat,lon,radius,size,height_scale,base_h):
     elev=fetch_elevation(lat,lon,radius,80);res=elev.shape[0]
     e_range=elev.max()-elev.min() or 1;norm=(elev-elev.min())/e_range*height_scale
@@ -632,22 +673,392 @@ MAP_HTML = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewp
 <title>Map to STL | SebGE Tools</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<style>*{box-sizing:border-box;margin:0;padding:0}:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}body{font-family:system-ui;background:var(--bg);color:var(--t);height:100vh;overflow:hidden}.app{display:grid;grid-template-columns:280px 1fr 260px;height:100vh}.panel{background:var(--c);padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto}.back{color:var(--t2);text-decoration:none;font-size:10px}.logo{display:flex;align-items:center;gap:8px;padding-bottom:8px;border-bottom:1px solid var(--br)}.logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--g),#009639);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px}.logo h1{font-size:13px}.search{position:relative}.search input{width:100%;padding:10px 10px 10px 32px;background:var(--c2);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:14px}.search input:focus{outline:none;border-color:var(--g)}.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--t2);width:14px;height:14px}.search-btn{position:absolute;right:4px;top:50%;transform:translateY(-50%);background:var(--g);border:none;color:#fff;padding:6px 12px;border-radius:4px;font-size:10px;cursor:pointer}.coords{display:flex;gap:6px;margin-top:4px}.coord{flex:1;background:var(--c2);border-radius:4px;padding:6px 8px;font-size:10px}.coord label{color:var(--t2);font-size:8px}.coord span{color:var(--g);font-family:monospace}.sec{background:var(--c2);border-radius:8px;padding:10px}.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;color:var(--g);margin-bottom:8px}.modes{display:flex;gap:4px}.mode{flex:1;padding:10px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center}.mode:hover,.mode.active{border-color:var(--g)}.mode .icon{font-size:20px}.mode .name{font-size:9px;font-weight:600}.slider{margin-bottom:6px}.slider-head{display:flex;justify-content:space-between}.slider label{font-size:10px;color:var(--t2)}.slider .val{font-size:10px;color:var(--g);font-family:monospace}.slider input{width:100%;height:6px;background:var(--c);border-radius:3px;-webkit-appearance:none}.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;background:var(--g);border-radius:50%;cursor:pointer}.btn{padding:12px;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;width:100%}.btn-primary{background:var(--g);color:#fff}.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}.btn:disabled{opacity:.4}.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}.status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}.map-container{position:relative;background:#111}#map{width:100%;height:100%}#preview3d{flex:1;background:var(--c2);border-radius:8px;min-height:150px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:4px}.stat{background:var(--c2);border-radius:5px;padding:8px;text-align:center}.stat label{font-size:8px;color:var(--t2)}.stat .val{font-size:12px;color:var(--g);font-family:monospace}.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}.footer a{color:var(--g)}.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:900px){body{height:auto}.app{display:block}.panel{min-height:50vh}.map-container{height:50vh}}</style></head><body>
-<div class="app"><div class="panel" id="panelSettings"><a href="/" class="back">← Back</a><div class="logo"><div class="logo-icon">🗺️</div><div><h1>Map → STL</h1><small>3D PRINT YOUR WORLD</small></div></div><div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="loc" placeholder="Search location..." value="Dusseldorf" onkeypress="if(event.key==='Enter')search()"><button class="search-btn" onclick="search()">Go</button></div><div class="coords"><div class="coord"><label>LAT</label><br><span id="latV">51.2277</span></div><div class="coord"><label>LON</label><br><span id="lonV">6.7735</span></div></div><div class="sec"><div class="sec-title">Mode</div><div class="modes"><div class="mode active" data-mode="streets" onclick="setMode('streets')"><div class="icon">🛣️</div><div class="name">Streets</div></div><div class="mode" data-mode="city" onclick="setMode('city')"><div class="icon">🏙️</div><div class="name">City</div></div><div class="mode" data-mode="terrain" onclick="setMode('terrain')"><div class="icon">🏔️</div><div class="name">Terrain</div></div></div></div><div class="sec"><div class="sec-title">Settings</div><div class="slider"><div class="slider-head"><label>Radius</label><span class="val" id="radV">500m</span></div><input type="range" id="rad" min="100" max="3000" value="500" step="50" oninput="updRad()"></div><div class="slider"><div class="slider-head"><label>Model Size</label><span class="val" id="sizeV">80mm</span></div><input type="range" id="size" min="30" max="200" value="80" step="5" oninput="$('sizeV').textContent=this.value+'mm'"></div><div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="htV">2mm</span></div><input type="range" id="ht" min="1" max="10" value="2" step="0.5" oninput="$('htV').textContent=this.value+'mm'"></div></div><div class="status" id="status"></div></div><div class="map-container" id="panelMap"><div id="map"></div></div><div class="panel" id="panelPreview"><div class="sec-title">3D Preview</div><div id="preview3d">Click Preview</div><div class="stats"><div class="stat"><label>Mode</label><div class="val" id="statMode">Streets</div></div><div class="stat"><label>Data</label><div class="val" id="statData">-</div></div></div><div class="btns"><button class="btn btn-secondary" id="btnPreview" onclick="preview()">Preview</button><button class="btn btn-primary" id="btnExport" onclick="exportSTL()">⬇ Export STL</button></div><div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div></div></div>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}
+body{font-family:system-ui;background:var(--bg);color:var(--t);height:100vh;overflow:hidden}
+.app{display:grid;grid-template-columns:320px 1fr 260px;height:100vh}
+.panel{background:var(--c);padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto}
+.back{color:var(--t2);text-decoration:none;font-size:10px}
+.logo{display:flex;align-items:center;gap:8px;padding-bottom:8px;border-bottom:1px solid var(--br)}
+.logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--g),#009639);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px}
+.logo h1{font-size:13px}
+.search{position:relative}
+.search input{width:100%;padding:10px 10px 10px 32px;background:var(--c2);border:1px solid var(--br);border-radius:6px;color:var(--t);font-size:14px}
+.search input:focus{outline:none;border-color:var(--g)}
+.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--t2);width:14px;height:14px}
+.search-btn{position:absolute;right:4px;top:50%;transform:translateY(-50%);background:var(--g);border:none;color:#fff;padding:6px 12px;border-radius:4px;font-size:10px;cursor:pointer}
+.coords{display:flex;gap:6px;margin-top:4px}
+.coord{flex:1;background:var(--c2);border-radius:4px;padding:6px 8px;font-size:10px}
+.coord label{color:var(--t2);font-size:8px}
+.coord span{color:var(--g);font-family:monospace}
+.sec{background:var(--c2);border-radius:8px;padding:10px}
+.sec-title{font-size:9px;font-weight:700;text-transform:uppercase;color:var(--g);margin-bottom:8px}
+.modes{display:flex;gap:4px}
+.mode{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center}
+.mode:hover,.mode.active{border-color:var(--g)}
+.mode .icon{font-size:18px}
+.mode .name{font-size:8px;font-weight:600}
+.mode .sub{font-size:7px;color:var(--t2)}
+.presets{display:flex;gap:4px;margin-bottom:8px}
+.preset{flex:1;padding:6px 4px;background:var(--c);border:1px solid var(--br);border-radius:4px;cursor:pointer;text-align:center;font-size:9px}
+.preset:hover,.preset.active{border-color:var(--g);background:rgba(0,174,66,0.1)}
+.preset .icon{font-size:12px}
+.street-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.street-item{display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--c);border-radius:4px;font-size:10px}
+.street-item .icon{font-size:14px}
+.street-item input{margin-left:auto}
+.markers{display:flex;gap:4px}
+.marker{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center}
+.marker:hover,.marker.active{border-color:var(--g)}
+.marker .icon{font-size:18px}
+.marker .name{font-size:8px}
+.slider{margin-bottom:6px}
+.slider-head{display:flex;justify-content:space-between}
+.slider label{font-size:10px;color:var(--t2)}
+.slider .val{font-size:10px;color:var(--g);font-family:monospace}
+.slider input{width:100%;height:6px;background:var(--c);border-radius:3px;-webkit-appearance:none}
+.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}
+.btn{padding:12px;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;width:100%}
+.btn-primary{background:var(--g);color:#fff}
+.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}
+.btn:disabled{opacity:.4}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}
+.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}
+.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}
+.map-container{position:relative;background:#111}
+#map{width:100%;height:100%}
+#preview3d{flex:1;background:var(--c2);border-radius:8px;min-height:150px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.stat{background:var(--c2);border-radius:5px;padding:8px;text-align:center}
+.stat label{font-size:8px;color:var(--t2)}
+.stat .val{font-size:12px;color:var(--g);font-family:monospace}
+.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:8px;border-top:1px solid var(--br)}
+.footer a{color:var(--g)}
+.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:900px){body{height:auto}.app{display:block}.panel{min-height:50vh}.map-container{height:50vh}}
+</style></head><body>
+<div class="app">
+<div class="panel" id="panelSettings">
+<a href="/" class="back">← Back</a>
+<div class="logo"><div class="logo-icon">🗺️</div><div><h1>Map → STL</h1><small>3D PRINT YOUR WORLD</small></div></div>
+<div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="loc" placeholder="Search location..." value="Dusseldorf" onkeypress="if(event.key==='Enter')search()"><button class="search-btn" onclick="search()">Go</button></div>
+<div class="coords"><div class="coord"><label>LAT</label><br><span id="latV">51.2277</span></div><div class="coord"><label>LON</label><br><span id="lonV">6.7735</span></div></div>
+
+<div class="sec">
+<div class="sec-title">Mode</div>
+<div class="modes">
+<div class="mode active" data-mode="streets" onclick="setMode('streets')"><div class="icon">🛣️</div><div class="name">Streets</div><div class="sub">Roads only</div></div>
+<div class="mode" data-mode="city" onclick="setMode('city')"><div class="icon">🏙️</div><div class="name">City</div><div class="sub">+Buildings</div></div>
+<div class="mode" data-mode="terrain" onclick="setMode('terrain')"><div class="icon">🏔️</div><div class="name">Terrain</div><div class="sub">+Elevation</div></div>
+</div>
+</div>
+
+<div class="sec" id="streetTypesSection">
+<div class="sec-title">Street Types</div>
+<div class="presets">
+<div class="preset" data-preset="city" onclick="applyPreset('city')"><span class="icon">🏙️</span> City</div>
+<div class="preset" data-preset="rural" onclick="applyPreset('rural')"><span class="icon">🚜</span> Rural</div>
+<div class="preset active" data-preset="all" onclick="applyPreset('all')"><span class="icon">📍</span> All</div>
+<div class="preset" data-preset="paths" onclick="applyPreset('paths')"><span class="icon">🚶</span> Paths</div>
+</div>
+<div class="street-grid">
+<div class="street-item"><span class="icon">🛣️</span>Highway<input type="checkbox" id="st_motorway" checked></div>
+<div class="street-item"><span class="icon">🛤️</span>Trunk<input type="checkbox" id="st_trunk" checked></div>
+<div class="street-item"><span class="icon">🔴</span>Primary<input type="checkbox" id="st_primary" checked></div>
+<div class="street-item"><span class="icon">🟠</span>Secondary<input type="checkbox" id="st_secondary" checked></div>
+<div class="street-item"><span class="icon">🟡</span>Tertiary<input type="checkbox" id="st_tertiary" checked></div>
+<div class="street-item"><span class="icon">🏘️</span>Residential<input type="checkbox" id="st_residential" checked></div>
+<div class="street-item"><span class="icon">📍</span>Unclassified<input type="checkbox" id="st_unclassified" checked></div>
+<div class="street-item"><span class="icon">🅿️</span>Service<input type="checkbox" id="st_service" checked></div>
+<div class="street-item"><span class="icon">🚜</span>Field Track<input type="checkbox" id="st_track" checked></div>
+<div class="street-item"><span class="icon">🥾</span>Path<input type="checkbox" id="st_path" checked></div>
+<div class="street-item"><span class="icon">🚶</span>Footway<input type="checkbox" id="st_footway" checked></div>
+<div class="street-item"><span class="icon">🚴</span>Cycleway<input type="checkbox" id="st_cycleway" checked></div>
+<div class="street-item"><span class="icon">🐴</span>Bridleway<input type="checkbox" id="st_bridleway" checked></div>
+<div class="street-item"><span class="icon">🚶</span>Pedestrian<input type="checkbox" id="st_pedestrian" checked></div>
+</div>
+</div>
+
+<div class="sec">
+<div class="sec-title">Center Marker</div>
+<div class="markers">
+<div class="marker active" data-marker="none" onclick="setMarker('none')"><div class="icon">✖️</div><div class="name">None</div></div>
+<div class="marker" data-marker="heart" onclick="setMarker('heart')"><div class="icon">❤️</div><div class="name">Heart</div></div>
+<div class="marker" data-marker="star" onclick="setMarker('star')"><div class="icon">⭐</div><div class="name">Star</div></div>
+<div class="marker" data-marker="pin" onclick="setMarker('pin')"><div class="icon">📍</div><div class="name">Pin</div></div>
+<div class="marker" data-marker="circle" onclick="setMarker('circle')"><div class="icon">⭕</div><div class="name">Circle</div></div>
+</div>
+<div class="slider" id="markerSizeSlider" style="margin-top:8px;display:none"><div class="slider-head"><label>Marker Size</label><span class="val" id="markerSizeV">14mm</span></div><input type="range" id="markerSize" min="5" max="30" value="14" step="1" oninput="$('markerSizeV').textContent=this.value+'mm'"></div>
+<div class="slider" id="markerGapSlider" style="display:none"><div class="slider-head"><label>Gap (Frame)</label><span class="val" id="markerGapV">1mm</span></div><input type="range" id="markerGap" min="0" max="5" value="1" step="0.5" oninput="$('markerGapV').textContent=this.value+'mm'"></div>
+</div>
+
+<div class="sec">
+<div class="sec-title">Settings</div>
+<div class="slider"><div class="slider-head"><label>Radius</label><span class="val" id="radV">1km</span></div><input type="range" id="rad" min="100" max="3000" value="1000" step="50" oninput="updRad()"></div>
+<div class="slider"><div class="slider-head"><label>Model Size</label><span class="val" id="sizeV">190mm</span></div><input type="range" id="size" min="30" max="250" value="190" step="5" oninput="$('sizeV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Line Width</label><span class="val" id="lwV">1.2mm</span></div><input type="range" id="lw" min="0.4" max="3" value="1.2" step="0.1" oninput="$('lwV').textContent=this.value+'mm'"></div>
+<div class="slider"><div class="slider-head"><label>Height</label><span class="val" id="htV">2mm</span></div><input type="range" id="ht" min="1" max="10" value="2" step="0.5" oninput="$('htV').textContent=this.value+'mm'"></div>
+</div>
+<div class="status" id="status"></div>
+</div>
+
+<div class="map-container" id="panelMap"><div id="map"></div></div>
+
+<div class="panel" id="panelPreview">
+<div class="sec-title">3D Preview</div>
+<div id="preview3d">Click Preview</div>
+<div class="stats">
+<div class="stat"><label>Mode</label><div class="val" id="statMode">Streets</div></div>
+<div class="stat"><label>Data</label><div class="val" id="statData">-</div></div>
+</div>
+<div class="btns"><button class="btn btn-secondary" id="btnPreview" onclick="preview()">Preview</button><button class="btn btn-primary" id="btnExport" onclick="exportSTL()">⬇ Export STL</button></div>
+<div class="footer">Made by <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div>
+</div>
+</div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>const $=id=>document.getElementById(id);let map,mapMarker,circle,lat=51.2277,lon=6.7735,mode='streets';let scene,camera,renderer,mesh;function init(){map=L.map('map',{zoomControl:false}).setView([lat,lon],14);L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);L.control.zoom({position:'topright'}).addTo(map);updateMap();map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;updateMap();updateCoords()});init3D();setTimeout(()=>map.invalidateSize(),100)}function init3D(){const c=$('preview3d');scene=new THREE.Scene();scene.background=new THREE.Color(0x1e1e1e);camera=new THREE.PerspectiveCamera(45,c.clientWidth/Math.max(c.clientHeight,150),0.1,1000);camera.position.set(80,80,80);renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(c.clientWidth,Math.max(c.clientHeight,150));scene.add(new THREE.AmbientLight(0xffffff,0.6));const dir=new THREE.DirectionalLight(0xffffff,0.8);dir.position.set(50,100,50);scene.add(dir)}function updateMap(){const r=+$('rad').value;if(mapMarker)map.removeLayer(mapMarker);if(circle)map.removeLayer(circle);mapMarker=L.marker([lat,lon]).addTo(map);circle=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.08,weight:2}).addTo(map)}function updRad(){const r=$('rad').value;$('radV').textContent=r>=1000?(r/1000)+'km':r+'m';if(circle)circle.setRadius(+r)}function updateCoords(){$('latV').textContent=lat.toFixed(5);$('lonV').textContent=lon.toFixed(5)}function setMode(m){mode=m;document.querySelectorAll('.mode').forEach(el=>el.classList.toggle('active',el.dataset.mode===m));$('statMode').textContent=m}async function search(){const q=$('loc').value.trim();if(!q)return;try{const r=await fetch('/api/geocode?q='+encodeURIComponent(q));const d=await r.json();if(d.error)throw new Error(d.error);lat=d.lat;lon=d.lon;map.setView([lat,lon],14);updateMap();updateCoords();msg('success','Found: '+d.name.substring(0,25))}catch(e){msg('error',e.message)}}async function preview(){const btn=$('btnPreview');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:1.2,mode})});const d=await r.json();if(d.error)throw new Error(d.error);load3DPreview(d.vertices,d.faces);$('statData').textContent=d.count;msg('success','Preview loaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='Preview'}}function load3DPreview(verts,faces){const c=$('preview3d');if(!renderer||renderer.domElement.width!==c.clientWidth){scene=new THREE.Scene();scene.background=new THREE.Color(0x1e1e1e);camera=new THREE.PerspectiveCamera(45,c.clientWidth/c.clientHeight,0.1,1000);camera.position.set(80,80,80);renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(c.clientWidth,c.clientHeight);scene.add(new THREE.AmbientLight(0xffffff,0.6));const dir=new THREE.DirectionalLight(0xffffff,0.8);dir.position.set(50,100,50);scene.add(dir)}if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose()}const geom=new THREE.BufferGeometry();geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));geom.setIndex(faces);geom.computeVertexNormals();const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});mesh=new THREE.Mesh(geom,mat);geom.computeBoundingBox();const center=new THREE.Vector3();geom.boundingBox.getCenter(center);mesh.position.sub(center);const maxDim=Math.max(geom.boundingBox.max.x-geom.boundingBox.min.x,geom.boundingBox.max.y-geom.boundingBox.min.y);mesh.scale.set(60/maxDim,60/maxDim,60/maxDim);scene.add(mesh);c.innerHTML='';c.appendChild(renderer.domElement);let angle=0;function animate(){requestAnimationFrame(animate);angle+=0.005;camera.position.x=Math.sin(angle)*100;camera.position.z=Math.cos(angle)*100;camera.lookAt(0,0,0);renderer.render(scene,camera)}animate()}async function exportSTL(){const btn=$('btnExport');btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';try{const r=await fetch('/api/map/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon,radius:+$('rad').value,size:+$('size').value,height:+$('ht').value,lineWidth:1.2,mode})});if(!r.ok){const err=await r.json();throw new Error(err.error)}const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='map.stl';a.click();msg('success','STL downloaded!')}catch(e){msg('error',e.message)}finally{btn.disabled=false;btn.innerHTML='⬇ Export STL'}}function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;setTimeout(()=>el.className='status',4000)}document.addEventListener('DOMContentLoaded',init);</script>
+<script>
+const $=id=>document.getElementById(id);
+let map,mapMarker,circle,lat=51.2277,lon=6.7735,mode='streets',markerType='none';
+let scene,camera,renderer,mesh;
+
+const streetTypes=['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','track','path','footway','cycleway','bridleway','pedestrian'];
+const presets={
+  city:['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','pedestrian'],
+  rural:['motorway','trunk','primary','secondary','tertiary','track','path','bridleway'],
+  all:streetTypes,
+  paths:['footway','path','cycleway','bridleway','pedestrian','track']
+};
+
+function init(){
+  map=L.map('map',{zoomControl:false}).setView([lat,lon],14);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19}).addTo(map);
+  L.control.zoom({position:'topright'}).addTo(map);
+  updateMap();
+  map.on('click',e=>{lat=e.latlng.lat;lon=e.latlng.lng;updateMap();updateCoords()});
+  init3D();
+  setTimeout(()=>map.invalidateSize(),100);
+}
+
+function init3D(){
+  const c=$('preview3d');
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0x1e1e1e);
+  camera=new THREE.PerspectiveCamera(45,c.clientWidth/Math.max(c.clientHeight,150),0.1,1000);
+  camera.position.set(80,80,80);
+  renderer=new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(c.clientWidth,Math.max(c.clientHeight,150));
+  scene.add(new THREE.AmbientLight(0xffffff,0.6));
+  const dir=new THREE.DirectionalLight(0xffffff,0.8);
+  dir.position.set(50,100,50);
+  scene.add(dir);
+}
+
+function updateMap(){
+  const r=+$('rad').value;
+  if(mapMarker)map.removeLayer(mapMarker);
+  if(circle)map.removeLayer(circle);
+  mapMarker=L.marker([lat,lon]).addTo(map);
+  circle=L.circle([lat,lon],{radius:r,color:'#00AE42',fillOpacity:.08,weight:2}).addTo(map);
+}
+
+function updRad(){
+  const r=$('rad').value;
+  $('radV').textContent=r>=1000?(r/1000)+'km':r+'m';
+  if(circle)circle.setRadius(+r);
+}
+
+function updateCoords(){
+  $('latV').textContent=lat.toFixed(5);
+  $('lonV').textContent=lon.toFixed(5);
+}
+
+function setMode(m){
+  mode=m;
+  document.querySelectorAll('.mode').forEach(el=>el.classList.toggle('active',el.dataset.mode===m));
+  $('statMode').textContent=m;
+  $('streetTypesSection').style.display=(m==='streets'||m==='city')?'block':'none';
+}
+
+function setMarker(m){
+  markerType=m;
+  document.querySelectorAll('.marker').forEach(el=>el.classList.toggle('active',el.dataset.marker===m));
+  const show=m!=='none';
+  $('markerSizeSlider').style.display=show?'block':'none';
+  $('markerGapSlider').style.display=show?'block':'none';
+}
+
+function applyPreset(p){
+  document.querySelectorAll('.preset').forEach(el=>el.classList.toggle('active',el.dataset.preset===p));
+  streetTypes.forEach(st=>{
+    const cb=$('st_'+st);
+    if(cb)cb.checked=presets[p].includes(st);
+  });
+}
+
+function getSelectedStreetTypes(){
+  return streetTypes.filter(st=>{
+    const cb=$('st_'+st);
+    return cb&&cb.checked;
+  });
+}
+
+async function search(){
+  const q=$('loc').value.trim();
+  if(!q)return;
+  try{
+    const r=await fetch('/api/geocode?q='+encodeURIComponent(q));
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    lat=d.lat;lon=d.lon;
+    map.setView([lat,lon],14);
+    updateMap();updateCoords();
+    msg('success','Found: '+d.name.substring(0,25));
+  }catch(e){msg('error',e.message);}
+}
+
+async function preview(){
+  const btn=$('btnPreview');
+  btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';
+  try{
+    const payload={
+      lat,lon,
+      radius:+$('rad').value,
+      size:+$('size').value,
+      height:+$('ht').value,
+      lineWidth:+$('lw').value,
+      mode,
+      streetTypes:getSelectedStreetTypes(),
+      markerType,
+      markerSize:+$('markerSize').value,
+      markerGap:+$('markerGap').value
+    };
+    const r=await fetch('/api/map/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    load3DPreview(d.vertices,d.faces);
+    $('statData').textContent=d.count;
+    msg('success','Preview loaded!');
+  }catch(e){msg('error',e.message);}
+  finally{btn.disabled=false;btn.innerHTML='Preview';}
+}
+
+function load3DPreview(verts,faces){
+  const c=$('preview3d');
+  if(!renderer||renderer.domElement.width!==c.clientWidth){
+    scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x1e1e1e);
+    camera=new THREE.PerspectiveCamera(45,c.clientWidth/c.clientHeight,0.1,1000);
+    camera.position.set(80,80,80);
+    renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(c.clientWidth,c.clientHeight);
+    scene.add(new THREE.AmbientLight(0xffffff,0.6));
+    const dir=new THREE.DirectionalLight(0xffffff,0.8);
+    dir.position.set(50,100,50);
+    scene.add(dir);
+  }
+  if(mesh){scene.remove(mesh);mesh.geometry.dispose();mesh.material.dispose();}
+  const geom=new THREE.BufferGeometry();
+  geom.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+  geom.setIndex(faces);
+  geom.computeVertexNormals();
+  const mat=new THREE.MeshPhongMaterial({color:0x00AE42,flatShading:true});
+  mesh=new THREE.Mesh(geom,mat);
+  geom.computeBoundingBox();
+  const center=new THREE.Vector3();
+  geom.boundingBox.getCenter(center);
+  mesh.position.sub(center);
+  const maxDim=Math.max(geom.boundingBox.max.x-geom.boundingBox.min.x,geom.boundingBox.max.y-geom.boundingBox.min.y);
+  mesh.scale.set(60/maxDim,60/maxDim,60/maxDim);
+  scene.add(mesh);
+  c.innerHTML='';
+  c.appendChild(renderer.domElement);
+  let angle=0;
+  function animate(){
+    requestAnimationFrame(animate);
+    angle+=0.005;
+    camera.position.x=Math.sin(angle)*100;
+    camera.position.z=Math.cos(angle)*100;
+    camera.lookAt(0,0,0);
+    renderer.render(scene,camera);
+  }
+  animate();
+}
+
+async function exportSTL(){
+  const btn=$('btnExport');
+  btn.disabled=true;btn.innerHTML='<div class="spinner"></div>';
+  try{
+    const payload={
+      lat,lon,
+      radius:+$('rad').value,
+      size:+$('size').value,
+      height:+$('ht').value,
+      lineWidth:+$('lw').value,
+      mode,
+      streetTypes:getSelectedStreetTypes(),
+      markerType,
+      markerSize:+$('markerSize').value,
+      markerGap:+$('markerGap').value
+    };
+    const r=await fetch('/api/map/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(!r.ok){const err=await r.json();throw new Error(err.error);}
+    const blob=await r.blob();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='map.stl';
+    a.click();
+    msg('success','STL downloaded!');
+  }catch(e){msg('error',e.message);}
+  finally{btn.disabled=false;btn.innerHTML='⬇ Export STL';}
+}
+
+function msg(type,text){
+  const el=$('status');
+  el.className='status '+type;
+  el.textContent=text;
+  setTimeout(()=>el.className='status',4000);
+}
+
+document.addEventListener('DOMContentLoaded',init);
+</script>
 </body></html>'''
 
 
 PRINT_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>HueForge Print | SebGE Tools</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}body{font-family:system-ui;background:var(--bg);color:var(--t);min-height:100vh}.app{display:grid;grid-template-columns:300px 1fr 280px;height:100vh}.panel{background:var(--c);padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:10px}.back{color:var(--t2);text-decoration:none;font-size:10px}.back:hover{color:var(--g)}.logo{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--br)}.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--g),#009639);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}.logo h1{font-size:14px}.logo small{display:block;font-size:8px;color:var(--g)}.sec{background:var(--c2);border-radius:8px;padding:12px}.sec-title{font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;font-weight:600}.upload{border:2px dashed var(--br);border-radius:8px;padding:24px 12px;text-align:center;cursor:pointer}.upload:hover{border-color:var(--g)}.upload p{font-size:11px;color:var(--t2)}.upload.has-img{padding:10px}.upload img{max-width:100%;max-height:120px;border-radius:6px}#file{display:none}.color-btns{display:flex;gap:6px}.color-btn{flex:1;padding:10px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;font-size:13px;font-weight:600;color:var(--t)}.color-btn:hover,.color-btn.active{border-color:var(--g);background:rgba(0,174,66,.1)}.layer-row{display:flex;align-items:center;gap:10px;padding:10px;background:var(--c);border-radius:8px;margin-bottom:8px}.layer-color{width:40px;height:40px;border-radius:8px;border:2px solid var(--br);cursor:pointer;padding:0}.layer-info{flex:1}.layer-name{font-size:11px;font-weight:600;margin-bottom:4px}.layer-thresh{width:100%;height:5px;background:var(--c2);border-radius:3px;-webkit-appearance:none}.layer-thresh::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}.slider{margin-bottom:8px}.slider-head{display:flex;justify-content:space-between;margin-bottom:4px}.slider label{font-size:10px;color:var(--t2)}.slider .val{font-size:10px;color:var(--g);font-family:monospace}.slider input{width:100%;height:5px;background:var(--c);border-radius:3px;-webkit-appearance:none}.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;background:var(--g);border-radius:50%;cursor:pointer}.btn{padding:12px;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;width:100%}.btn-primary{background:var(--g);color:#fff}.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}.btn:disabled{opacity:.4;cursor:not-allowed}.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.preview-panel{background:#222;display:flex;flex-direction:column}.preview-header{padding:12px;border-bottom:1px solid var(--br)}.preview-header h2{font-size:13px}.preview-area{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;background:#181818}#canvas{max-width:100%;max-height:100%;border-radius:8px}.instr{background:var(--c);font-family:monospace;font-size:10px;padding:12px;border-radius:8px;white-space:pre-wrap;line-height:1.6;max-height:180px;overflow-y:auto}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px}.stat{background:var(--c2);border-radius:6px;padding:8px;text-align:center}.stat label{font-size:8px;color:var(--t2);text-transform:uppercase}.stat .v{font-size:12px;color:var(--g);font-family:monospace;font-weight:600}.status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:10px;border-top:1px solid var(--br)}.footer a{color:var(--g)}.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:950px){.app{display:block;height:auto}.panel,.preview-panel{min-height:50vh}}
+*{box-sizing:border-box;margin:0;padding:0}:root{--g:#00AE42;--bg:#0a0a0a;--c:#151515;--c2:#1e1e1e;--br:#2a2a2a;--t:#fff;--t2:#888}body{font-family:system-ui;background:var(--bg);color:var(--t);min-height:100vh}.app{display:grid;grid-template-columns:300px 1fr 280px;height:100vh}.panel{background:var(--c);padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:10px}.back{color:var(--t2);text-decoration:none;font-size:10px}.back:hover{color:var(--g)}.logo{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--br)}.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--g),#009639);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px}.logo h1{font-size:14px}.logo small{display:block;font-size:8px;color:var(--g)}.sec{background:var(--c2);border-radius:8px;padding:12px}.sec-title{font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;font-weight:600}.upload{border:2px dashed var(--br);border-radius:8px;padding:24px 12px;text-align:center;cursor:pointer}.upload:hover{border-color:var(--g)}.upload p{font-size:11px;color:var(--t2)}.upload.has-img{padding:10px}.upload img{max-width:100%;max-height:120px;border-radius:6px}#file{display:none}.color-row{display:flex;gap:6px;align-items:center;margin-bottom:8px}.color-btns{display:flex;gap:4px;flex:1}.color-btn{flex:1;padding:8px 4px;background:var(--c);border:2px solid var(--br);border-radius:6px;cursor:pointer;text-align:center;font-size:12px;font-weight:600;color:var(--t)}.color-btn:hover,.color-btn.active{border-color:var(--g);background:rgba(0,174,66,.1)}.color-input{width:50px;padding:8px;background:var(--c);border:2px solid var(--br);border-radius:6px;color:var(--t);font-size:12px;text-align:center}.color-input:focus{outline:none;border-color:var(--g)}.auto-btn{padding:8px 12px;background:linear-gradient(135deg,#9333EA,#7C3AED);border:none;border-radius:6px;color:#fff;font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap}.auto-btn:hover{opacity:.9}.auto-btn:disabled{opacity:.4}.layer-row{display:flex;align-items:center;gap:10px;padding:10px;background:var(--c);border-radius:8px;margin-bottom:8px}.layer-color{width:40px;height:40px;border-radius:8px;border:2px solid var(--br);cursor:pointer;padding:0}.layer-info{flex:1}.layer-name{font-size:11px;font-weight:600;margin-bottom:4px}.layer-thresh{width:100%;height:5px;background:var(--c2);border-radius:3px;-webkit-appearance:none}.layer-thresh::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--g);border-radius:50%;cursor:pointer}.slider{margin-bottom:8px}.slider-head{display:flex;justify-content:space-between;margin-bottom:4px}.slider label{font-size:10px;color:var(--t2)}.slider .val{font-size:10px;color:var(--g);font-family:monospace}.slider input{width:100%;height:5px;background:var(--c);border-radius:3px;-webkit-appearance:none}.slider input::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;background:var(--g);border-radius:50%;cursor:pointer}.btn{padding:12px;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;width:100%}.btn-primary{background:var(--g);color:#fff}.btn-secondary{background:var(--c2);color:var(--t);border:1px solid var(--br)}.btn:disabled{opacity:.4;cursor:not-allowed}.preview-panel{background:#222;display:flex;flex-direction:column}.preview-header{padding:12px;border-bottom:1px solid var(--br)}.preview-header h2{font-size:13px}.preview-area{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;background:#181818}#canvas{max-width:100%;max-height:100%;border-radius:8px}.instr{background:var(--c);font-family:monospace;font-size:10px;padding:12px;border-radius:8px;white-space:pre-wrap;line-height:1.6;max-height:180px;overflow-y:auto}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px}.stat{background:var(--c2);border-radius:6px;padding:8px;text-align:center}.stat label{font-size:8px;color:var(--t2);text-transform:uppercase}.stat .v{font-size:12px;color:var(--g);font-family:monospace;font-weight:600}.status{padding:8px;border-radius:6px;font-size:10px;display:none;text-align:center}.status.error{display:block;background:rgba(239,68,68,.1);color:#ef4444}.status.success{display:block;background:rgba(0,174,66,.1);color:var(--g)}.footer{margin-top:auto;text-align:center;font-size:9px;color:var(--t2);padding-top:10px;border-top:1px solid var(--br)}.footer a{color:var(--g)}.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:950px){.app{display:block;height:auto}.panel,.preview-panel{min-height:50vh}}
 </style></head><body>
 <div class="app">
 <div class="panel"><a href="/" class="back">← Back</a><div class="logo"><div class="logo-icon">🖼️</div><div><h1>HueForge Print</h1><small>LITHOPHANE STL</small></div></div>
 <div class="upload" id="upload" onclick="document.getElementById('file').click()"><p>📤 Drop image or click</p></div><input type="file" id="file" accept="image/*">
-<div class="sec"><div class="sec-title">Colors</div><div class="color-btns"><div class="color-btn active" onclick="setColors(2)">2</div><div class="color-btn" onclick="setColors(3)">3</div><div class="color-btn" onclick="setColors(4)">4</div></div></div>
+<div class="sec">
+<div class="sec-title">Colors</div>
+<div class="color-row">
+<div class="color-btns">
+<div class="color-btn active" onclick="setColors(2)">2</div>
+<div class="color-btn" onclick="setColors(3)">3</div>
+<div class="color-btn" onclick="setColors(4)">4</div>
+<div class="color-btn" onclick="setColors(5)">5</div>
+<div class="color-btn" onclick="setColors(6)">6</div>
+</div>
+<input type="number" class="color-input" id="customColors" min="2" max="10" value="" placeholder="#" title="Custom: 2-10" onchange="setColors(+this.value)">
+</div>
+<button class="auto-btn" id="autoBtn" onclick="fullAuto()" disabled>✨ Auto Colors + Thresholds</button>
+<div style="display:flex;gap:6px;margin-top:6px">
+<button class="auto-btn" style="flex:1;background:#666" onclick="autoColors()" disabled id="colorBtn">🎨 Extract Colors</button>
+<button class="auto-btn" style="flex:1;background:#666" onclick="autoThresholds()" disabled id="threshBtn">📊 Auto Thresholds</button>
+</div>
+<div style="margin-top:8px">
+<label style="display:flex;align-items:center;gap:8px;font-size:11px;cursor:pointer">
+<input type="checkbox" id="colorMatchToggle" onchange="colorMatchMode=this.checked;renderLayers();updatePreview();updateInstr()" style="accent-color:var(--g)">
+<span>Color-Match Mode (for colorful images)</span>
+</label>
+</div>
+</div>
 <div class="sec"><div class="sec-title">Thresholds</div><div id="layers"></div></div>
 <div class="sec"><div class="sec-title">Model</div>
 <div class="slider"><div class="slider-head"><label>Width</label><span class="val" id="wV">100mm</span></div><input type="range" id="w" min="50" max="200" value="100" step="5" oninput="$('wV').textContent=this.value+'mm'"></div>
@@ -657,37 +1068,103 @@ PRINT_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="vie
 <div class="status" id="status"></div></div>
 <div class="preview-panel"><div class="preview-header"><h2>Preview</h2></div><div class="preview-area"><canvas id="canvas"></canvas><div id="ph" style="color:#666">Upload image</div></div></div>
 <div class="panel"><div class="sec-title">Instructions</div><div class="instr" id="instr">1. Upload image
-2. Choose colors
-3. Adjust thresholds
+2. Choose colors (2-10)
+3. Click Auto-Optimize or adjust manually
 4. Export STL</div>
 <div class="stats"><div class="stat"><label>W</label><div class="v" id="stW">-</div></div><div class="stat"><label>H</label><div class="v" id="stH">-</div></div><div class="stat"><label>L</label><div class="v" id="stL">-</div></div></div>
 <button class="btn btn-primary" id="btnSTL" onclick="exportSTL()" disabled>⬇ Download STL</button>
 <div class="footer">By <a href="https://makerworld.com/de/@SebGE" target="_blank">@SebGE</a></div></div></div>
 <script>
-const $=id=>document.getElementById(id);let imgData=null,grayData=null,numColors=2;
-// Default: evenly distributed thresholds (pixel values where color changes)
-const defaultLayers={
-    2:[{c:'#FFFFFF',t:128,n:'Light'},{c:'#222222',t:0,n:'Dark'}],
-    3:[{c:'#FFFFFF',t:170,n:'Light'},{c:'#888888',t:85,n:'Medium'},{c:'#222222',t:0,n:'Dark'}],
-    4:[{c:'#FFFFFF',t:192,n:'Lightest'},{c:'#BBBBBB',t:128,n:'Light'},{c:'#666666',t:64,n:'Dark'},{c:'#222222',t:0,n:'Darkest'}]
-};
-let layers=JSON.parse(JSON.stringify(defaultLayers[2]));
+const $=id=>document.getElementById(id);
+let imgData=null,grayData=null,originalImgData=null,numColors=2;
+let layers=[];
+
+// Generate default colors (grayscale gradient)
+function generateDefaultLayers(n){
+    const arr=[];
+    for(let i=0;i<n;i++){
+        const frac=i/(n-1);
+        const gray=Math.round(255*(1-frac));
+        const hex='#'+gray.toString(16).padStart(2,'0').repeat(3);
+        const thresh=i===n-1?0:Math.round(255*(1-i/(n-1)));
+        const names=['Lightest','Light','Medium-Light','Medium','Medium-Dark','Dark','Darker','Darkest','Black','Deep Black'];
+        arr.push({c:hex.toUpperCase(),t:thresh,n:names[Math.min(i,names.length-1)]});
+    }
+    return arr;
+}
 
 function renderLayers(){
     const el=$('layers');el.innerHTML='';
+    const t=+$('h').value,b=+$('b').value,layerH=0.12;
+    const totalLayers=Math.round(t/layerH);
+    
     layers.forEach((l,i)=>{
-        const isLast=i===layers.length-1;
-        el.innerHTML+=`<div class="layer-row">
-            <input type="color" class="layer-color" value="${l.c}" onchange="layers[${i}].c=this.value;updatePreview()">
-            <div class="layer-info">
-                <div class="layer-name">${l.n||'Color '+(i+1)}</div>
-                ${isLast?'<div style="font-size:9px;color:#666">Darkest pixels (base)</div>'
-                :`<input type="range" class="layer-thresh" min="1" max="254" value="${l.t}" 
-                    oninput="layers[${i}].t=+this.value;updatePreview();updateSliderLabel(${i})">
-                <div class="slider-label" id="sl${i}" style="font-size:9px;color:#666;margin-top:2px">Pixels ≥ ${l.t}</div>`}
-            </div>
-        </div>`;
+        const rgb=hexToRgb(l.c);
+        const brightness=(rgb[0]+rgb[1]+rgb[2])/3;
+        const defaultLayer=Math.round(b/layerH + (1-brightness/255)*(totalLayers-b/layerH));
+        const currentLayer=l.layer!==undefined?l.layer:defaultLayer;
+        const canDelete=layers.length>2;
+        
+        if(colorMatchMode){
+            // Color-match mode: show color picker and info, no layer slider
+            el.innerHTML+=`<div class="layer-row">
+                <input type="color" class="layer-color" value="${l.c}" onchange="layers[${i}].c=this.value;updatePreview();updateInstr()">
+                <div class="layer-info">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <div class="layer-name">Color ${i+1}</div>
+                        ${canDelete?`<button onclick="deleteColor(${i})" style="background:none;border:none;color:#f44;cursor:pointer;font-size:14px;padding:2px 6px" title="Delete">✕</button>`:''}
+                    </div>
+                    <div style="font-size:9px;color:#666">Print @ Layer ${currentLayer} (by brightness)</div>
+                </div>
+            </div>`;
+        } else {
+            // Layer mode: show slider to adjust layer threshold
+            el.innerHTML+=`<div class="layer-row">
+                <input type="color" class="layer-color" value="${l.c}" onchange="layers[${i}].c=this.value;updatePreview();updateInstr()">
+                <div class="layer-info">
+                    <div style="display:flex;justify-content:space-between;align-items:center">
+                        <div class="layer-name">Color ${i+1}</div>
+                        ${canDelete?`<button onclick="deleteColor(${i})" style="background:none;border:none;color:#f44;cursor:pointer;font-size:14px;padding:2px 6px" title="Delete">✕</button>`:''}
+                    </div>
+                    <input type="range" class="layer-thresh" min="1" max="${totalLayers}" value="${currentLayer}" 
+                        oninput="layers[${i}].layer=+this.value;updateLayerLabel(${i});updatePreview();updateInstr()">
+                    <div class="slider-label" id="ll${i}" style="font-size:9px;color:#666;margin-top:2px">Layer ${currentLayer} / ${totalLayers}</div>
+                </div>
+            </div>`;
+        }
     });
+    
+    // Add "Add Color" button
+    if(layers.length<10){
+        el.innerHTML+=`<button onclick="addColor()" style="width:100%;padding:10px;background:var(--c);border:1px dashed var(--br);border-radius:8px;color:var(--t2);cursor:pointer;font-size:11px;margin-top:4px">+ Add Color</button>`;
+    }
+}
+
+function updateLayerLabel(i){
+    const t=+$('h').value,layerH=0.12;
+    const totalLayers=Math.round(t/layerH);
+    const label=$('ll'+i);
+    if(label)label.textContent='Layer '+layers[i].layer+' / '+totalLayers;
+}
+
+function deleteColor(i){
+    if(layers.length<=2)return;
+    layers.splice(i,1);
+    renderLayers();
+    updatePreview();
+    updateInstr();
+}
+
+function addColor(){
+    if(layers.length>=10)return;
+    // Add a gray color in the middle
+    const t=+$('h').value,b=+$('b').value,layerH=0.12;
+    const totalLayers=Math.round(t/layerH);
+    const midLayer=Math.round((totalLayers+b/layerH)/2);
+    layers.push({c:'#888888',layer:midLayer});
+    renderLayers();
+    updatePreview();
+    updateInstr();
 }
 
 function updateSliderLabel(i){
@@ -696,39 +1173,327 @@ function updateSliderLabel(i){
 }
 
 function setColors(n){
+    n=Math.max(2,Math.min(10,n||2));
     numColors=n;
-    document.querySelectorAll('.color-btn').forEach((b,i)=>b.classList.toggle('active',i===n-2));
-    layers=JSON.parse(JSON.stringify(defaultLayers[n]));
+    document.querySelectorAll('.color-btn').forEach((b,i)=>b.classList.toggle('active',(i+2)===n));
+    $('customColors').value=n>6?n:'';
+    layers=generateDefaultLayers(n);
+    
+    // Set default layer values based on brightness
+    const t=+$('h').value,b=+$('b').value,layerH=0.12;
+    const totalLayers=Math.round(t/layerH);
+    layers.forEach((l,i)=>{
+        const rgb=hexToRgb(l.c);
+        const brightness=(rgb[0]+rgb[1]+rgb[2])/3;
+        l.layer=Math.round(b/layerH + (1-brightness/255)*(totalLayers-b/layerH));
+    });
+    
     renderLayers();
     updatePreview();
     updateInstr();
 }
 
-const up=$('upload');up.ondragover=e=>{e.preventDefault();up.style.borderColor='#00AE42'};up.ondragleave=()=>up.style.borderColor='#2a2a2a';up.ondrop=e=>{e.preventDefault();up.style.borderColor='#2a2a2a';if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])};
+// Auto-optimize thresholds based on image histogram
+function autoThresholds(){
+    if(!grayData)return;
+    
+    // Build histogram
+    const hist=new Array(256).fill(0);
+    for(let i=0;i<grayData.length;i++)hist[grayData[i]]++;
+    
+    // Find optimal thresholds using quantiles
+    const total=grayData.length;
+    const n=layers.length;
+    const thresholds=[];
+    
+    // Calculate cumulative distribution
+    let cumulative=0;
+    const cdf=[];
+    for(let i=0;i<256;i++){
+        cumulative+=hist[i];
+        cdf[i]=cumulative/total;
+    }
+    
+    // Find threshold values that divide the image into equal portions
+    for(let i=0;i<n-1;i++){
+        const targetPercentile=1-(i+1)/n;
+        // Find the gray value closest to this percentile
+        for(let g=255;g>=0;g--){
+            if(cdf[g]<=targetPercentile){
+                thresholds.push(Math.max(1,g));
+                break;
+            }
+        }
+    }
+    thresholds.push(0);
+    
+    // Apply thresholds to layers
+    for(let i=0;i<layers.length;i++){
+        layers[i].t=thresholds[i]||0;
+    }
+    
+    renderLayers();
+    updatePreview();
+    updateInstr();
+    msg('success','Thresholds optimized for your image!');
+}
+
+// Extract dominant colors from the original image
+function autoColors(){
+    if(!originalImgData)return;
+    
+    const canvas=document.createElement('canvas');
+    const ctx=canvas.getContext('2d');
+    const img=new Image();
+    
+    img.onload=()=>{
+        // Use full resolution for better color detection
+        const maxSize=150;
+        let w=img.width,h=img.height;
+        if(w>maxSize||h>maxSize){
+            const s=maxSize/Math.max(w,h);
+            w=Math.round(w*s);h=Math.round(h*s);
+        }
+        canvas.width=w;
+        canvas.height=h;
+        ctx.drawImage(img,0,0,w,h);
+        const data=ctx.getImageData(0,0,w,h).data;
+        
+        // Collect all pixels, skip near-white and near-black
+        const pixels=[];
+        for(let i=0;i<data.length;i+=4){
+            const r=data[i],g=data[i+1],b=data[i+2];
+            const brightness=(r+g+b)/3;
+            // Keep all pixels except pure white/black
+            if(brightness>10 && brightness<250){
+                pixels.push({r,g,b});
+            }
+        }
+        
+        // If too few pixels, use all
+        if(pixels.length<50){
+            pixels.length=0;
+            for(let i=0;i<data.length;i+=4){
+                pixels.push({r:data[i],g:data[i+1],b:data[i+2]});
+            }
+        }
+        
+        // K-means++ initialization
+        const k=layers.length;
+        let centroids=[];
+        
+        // First centroid: most saturated pixel
+        let maxSat=0,firstPixel=pixels[0];
+        for(const p of pixels){
+            const max=Math.max(p.r,p.g,p.b),min=Math.min(p.r,p.g,p.b);
+            const sat=max>0?(max-min)/max:0;
+            if(sat>maxSat){maxSat=sat;firstPixel=p;}
+        }
+        centroids.push({...firstPixel});
+        
+        // Remaining centroids: maximize distance to existing
+        while(centroids.length<k){
+            let bestPixel=null,bestMinDist=0;
+            for(const p of pixels){
+                let minDist=Infinity;
+                for(const c of centroids){
+                    const dist=Math.pow(p.r-c.r,2)+Math.pow(p.g-c.g,2)+Math.pow(p.b-c.b,2);
+                    if(dist<minDist)minDist=dist;
+                }
+                if(minDist>bestMinDist){bestMinDist=minDist;bestPixel=p;}
+            }
+            if(bestPixel)centroids.push({...bestPixel});
+            else break;
+        }
+        
+        // Run k-means iterations
+        for(let iter=0;iter<25;iter++){
+            const clusters=Array.from({length:k},()=>[]);
+            for(const p of pixels){
+                let bestIdx=0,bestDist=Infinity;
+                for(let i=0;i<centroids.length;i++){
+                    const dist=Math.pow(p.r-centroids[i].r,2)+
+                               Math.pow(p.g-centroids[i].g,2)+
+                               Math.pow(p.b-centroids[i].b,2);
+                    if(dist<bestDist){bestDist=dist;bestIdx=i;}
+                }
+                clusters[bestIdx].push(p);
+            }
+            
+            for(let i=0;i<k;i++){
+                if(clusters[i].length>0){
+                    centroids[i]={
+                        r:Math.round(clusters[i].reduce((s,p)=>s+p.r,0)/clusters[i].length),
+                        g:Math.round(clusters[i].reduce((s,p)=>s+p.g,0)/clusters[i].length),
+                        b:Math.round(clusters[i].reduce((s,p)=>s+p.b,0)/clusters[i].length)
+                    };
+                }
+            }
+        }
+        
+        // Check if we need to add white (common background)
+        const hasWhite=centroids.some(c=>c.r>230&&c.g>230&&c.b>230);
+        if(!hasWhite){
+            // Check if image has white background
+            const corners=[
+                {r:data[0],g:data[1],b:data[2]},
+                {r:data[(w-1)*4],g:data[(w-1)*4+1],b:data[(w-1)*4+2]},
+                {r:data[(h-1)*w*4],g:data[(h-1)*w*4+1],b:data[(h-1)*w*4+2]},
+                {r:data[((h-1)*w+w-1)*4],g:data[((h-1)*w+w-1)*4+1],b:data[((h-1)*w+w-1)*4+2]}
+            ];
+            const avgCorner={
+                r:Math.round(corners.reduce((s,c)=>s+c.r,0)/4),
+                g:Math.round(corners.reduce((s,c)=>s+c.g,0)/4),
+                b:Math.round(corners.reduce((s,c)=>s+c.b,0)/4)
+            };
+            if(avgCorner.r>200&&avgCorner.g>200&&avgCorner.b>200){
+                // Replace darkest centroid with white
+                centroids.sort((a,b)=>(a.r+a.g+a.b)-(b.r+b.g+b.b));
+                centroids[0]={r:255,g:255,b:255};
+            }
+        }
+        
+        // Sort by brightness (lightest first for HueForge)
+        centroids.sort((a,b)=>(b.r+b.g+b.b)-(a.r+a.g+a.b));
+        
+        // Apply colors to layers
+        for(let i=0;i<layers.length;i++){
+            const c=centroids[i]||centroids[centroids.length-1];
+            layers[i].c='#'+[c.r,c.g,c.b].map(v=>Math.min(255,Math.max(0,v)).toString(16).padStart(2,'0')).join('');
+            // Reset layer value so it gets recalculated
+            delete layers[i].layer;
+        }
+        
+        // Enable color-match mode
+        colorMatchMode=true;
+        if($('colorMatchToggle'))$('colorMatchToggle').checked=true;
+        
+        renderLayers();
+        updatePreview();
+        updateInstr();
+        msg('success','Colors extracted! '+k+' colors found.');
+    };
+    img.src=originalImgData;
+}
+
+// Full auto: optimize both colors AND thresholds
+function fullAuto(){
+    if(!originalImgData||!grayData)return;
+    autoColors();
+    setTimeout(()=>autoThresholds(),100);
+}
+
+const up=$('upload');
+up.ondragover=e=>{e.preventDefault();up.style.borderColor='#00AE42'};
+up.ondragleave=()=>up.style.borderColor='#2a2a2a';
+up.ondrop=e=>{e.preventDefault();up.style.borderColor='#2a2a2a';if(e.dataTransfer.files.length)handleFile(e.dataTransfer.files[0])};
 $('file').onchange=e=>{if(e.target.files.length)handleFile(e.target.files[0])};
-function handleFile(f){if(!f.type.startsWith('image/'))return;const r=new FileReader();r.onload=e=>{imgData=e.target.result;up.innerHTML='<img src="'+imgData+'">';up.classList.add('has-img');loadPreview(imgData)};r.readAsDataURL(f)}
-function loadPreview(src){const img=new Image();img.onload=()=>{const c=$('canvas'),x=c.getContext('2d'),maxS=500;let w=img.width,h=img.height;if(w>maxS||h>maxS){const s=maxS/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s)}c.width=w;c.height=h;x.drawImage(img,0,0,w,h);const d=x.getImageData(0,0,w,h);grayData=new Uint8Array(w*h);for(let i=0;i<w*h;i++)grayData[i]=Math.round(0.299*d.data[i*4]+0.587*d.data[i*4+1]+0.114*d.data[i*4+2]);c.style.display='block';$('ph').style.display='none';$('btnSTL').disabled=false;updatePreview()};img.src=src}
+
+function handleFile(f){
+    if(!f.type.startsWith('image/'))return;
+    const r=new FileReader();
+    r.onload=e=>{
+        imgData=e.target.result;
+        originalImgData=e.target.result; // Keep original for color extraction
+        up.innerHTML='<img src="'+imgData+'">';
+        up.classList.add('has-img');
+        loadPreview(imgData);
+    };
+    r.readAsDataURL(f);
+}
+
+function loadPreview(src){
+    const img=new Image();
+    img.onload=()=>{
+        const c=$('canvas'),x=c.getContext('2d'),maxS=500;
+        let w=img.width,h=img.height;
+        if(w>maxS||h>maxS){const s=maxS/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s)}
+        c.width=w;c.height=h;
+        x.drawImage(img,0,0,w,h);
+        const d=x.getImageData(0,0,w,h);
+        grayData=new Uint8Array(w*h);
+        originalColorData=new Uint8Array(w*h*3); // Store RGB
+        for(let i=0;i<w*h;i++){
+            grayData[i]=Math.round(0.299*d.data[i*4]+0.587*d.data[i*4+1]+0.114*d.data[i*4+2]);
+            originalColorData[i*3]=d.data[i*4];
+            originalColorData[i*3+1]=d.data[i*4+1];
+            originalColorData[i*3+2]=d.data[i*4+2];
+        }
+        c.style.display='block';
+        $('ph').style.display='none';
+        $('btnSTL').disabled=false;
+        $('autoBtn').disabled=false;
+        $('colorBtn').disabled=false;
+        $('threshBtn').disabled=false;
+        updatePreview();
+    };
+    img.src=src;
+}
+
 function hexToRgb(h){return[parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)]}
+
+// Store original color data for color-matching mode
+let originalColorData=null;
+let colorMatchMode=false;
 
 function updatePreview(){
     if(!grayData)return;
     const c=$('canvas'),x=c.getContext('2d'),w=c.width,h=c.height,d=x.createImageData(w,h);
+    const t=+$('h').value,b=+$('b').value,layerH=0.12;
+    const totalLayers=Math.round(t/layerH);
     
-    // Sort by threshold descending (highest threshold first = brightest color)
-    const sorted=[...layers].sort((a,b)=>(b.t||0)-(a.t||0));
-    
-    for(let i=0;i<w*h;i++){
-        const g=grayData[i];
-        // Find which color: check from brightest to darkest
-        let rgb=hexToRgb(sorted[sorted.length-1].c); // Default darkest
-        for(const l of sorted){
-            if(g>=l.t){
-                rgb=hexToRgb(l.c);
-                break;
+    if(colorMatchMode && originalColorData){
+        // Color-match mode: assign pixels by color similarity
+        const layerRgb=layers.map(l=>hexToRgb(l.c));
+        
+        for(let i=0;i<w*h;i++){
+            const pr=originalColorData[i*3];
+            const pg=originalColorData[i*3+1];
+            const pb=originalColorData[i*3+2];
+            
+            let bestIdx=0,bestDist=Infinity;
+            for(let j=0;j<layerRgb.length;j++){
+                const dist=Math.pow(pr-layerRgb[j][0],2)+Math.pow(pg-layerRgb[j][1],2)+Math.pow(pb-layerRgb[j][2],2);
+                if(dist<bestDist){bestDist=dist;bestIdx=j;}
             }
+            const rgb=layerRgb[bestIdx];
+            d.data[i*4]=rgb[0];d.data[i*4+1]=rgb[1];d.data[i*4+2]=rgb[2];d.data[i*4+3]=255;
         }
-        d.data[i*4]=rgb[0];d.data[i*4+1]=rgb[1];d.data[i*4+2]=rgb[2];d.data[i*4+3]=255;
+    } else {
+        // Layer mode: convert layer values to grayscale thresholds
+        // Each color has a layer value (1-20), we need to find which grayscale range it covers
+        
+        // Get all colors with their layer values, sorted by layer (low to high)
+        const sortedColors=layers.map((l,i)=>{
+            const rgb=hexToRgb(l.c);
+            const brightness=(rgb[0]+rgb[1]+rgb[2])/3;
+            const defaultLayer=Math.round(5 + (1-brightness/255)*15);
+            return {
+                rgb:rgb,
+                layer:l.layer!==undefined?l.layer:defaultLayer
+            };
+        }).sort((a,b)=>a.layer-b.layer);
+        
+        // For each pixel, find which color based on its grayscale value
+        for(let i=0;i<w*h;i++){
+            const g=grayData[i];
+            // Convert grayscale 0-255 to layer 1-totalLayers
+            // Bright (255) = layer 1, Dark (0) = layer totalLayers
+            const pixelLayer=Math.round(1 + (1-g/255)*(totalLayers-1));
+            
+            // Find the color whose layer is >= pixelLayer (first one that covers this layer)
+            let rgb=sortedColors[sortedColors.length-1].rgb; // Default to darkest
+            for(let j=0;j<sortedColors.length;j++){
+                if(sortedColors[j].layer>=pixelLayer){
+                    rgb=sortedColors[j].rgb;
+                    break;
+                }
+            }
+            
+            d.data[i*4]=rgb[0];d.data[i*4+1]=rgb[1];d.data[i*4+2]=rgb[2];d.data[i*4+3]=255;
+        }
     }
+    
     x.putImageData(d,0,0);
 }
 
@@ -736,27 +1501,55 @@ function updateInstr(){
     const t=+$('h').value,b=+$('b').value,layerH=0.12;
     const totalLayers=Math.round(t/layerH);
     const reliefH=t-b;
-    
     $('stL').textContent=totalLayers;
     
-    // Sort by threshold descending for display
-    const sorted=[...layers].map((l,i)=>({...l,i})).sort((a,b)=>(b.t||0)-(a.t||0));
+    // Sort colors by their layer value
+    const sortedColors=layers.map((l,i)=>{
+        const rgb=hexToRgb(l.c);
+        const brightness=(rgb[0]+rgb[1]+rgb[2])/3;
+        const defaultLayer=Math.round(b/layerH + (1-brightness/255)*(totalLayers-b/layerH));
+        return {
+            c:l.c,
+            layer:l.layer!==undefined?l.layer:defaultLayer,
+            i
+        };
+    }).sort((a,b)=>a.layer-b.layer);
     
     let txt=`Total: ${t}mm | ${totalLayers} layers\n\n`;
-    sorted.forEach((l,i)=>{
-        // Higher threshold = brighter pixels = lower Z (printed first)
-        const heightFrac=1-(l.t/255);
-        const z=b+(reliefH*heightFrac);
-        const layerNum=Math.round(z/layerH);
-        txt+=`${i+1}. ${l.c} - Layer ${layerNum} (Z≈${z.toFixed(1)}mm)\n`;
+    txt+=`Print order:\n`;
+    sortedColors.forEach((col,idx)=>{
+        const z=(col.layer*layerH);
+        txt+=`${idx+1}. ${col.c} @ Layer ${col.layer} (${z.toFixed(1)}mm)\n`;
     });
-    txt+=`\nBrightest first, darkest last.`;
+    
+    if(colorMatchMode){
+        txt+=`\n🎨 Color-Match Mode`;
+    } else {
+        txt+=`\n📊 Layer Mode`;
+    }
     $('instr').textContent=txt;
 }
 
-async function exportSTL(){if(!imgData)return;$('btnSTL').disabled=true;$('btnSTL').innerHTML='<span class="spinner"></span>';try{const r=await fetch('/api/print/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:imgData,width:+$('w').value,total_height:+$('h').value,base_height:+$('b').value,border:2,contrast:1.5,denoise:2})});if(!r.ok)throw new Error('Failed');const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='hueforge.stl';a.click();$('stW').textContent=$('w').value+'mm';$('stH').textContent=Math.round(+$('w').value*$('canvas').height/$('canvas').width)+'mm'}catch(e){alert(e.message)}finally{$('btnSTL').disabled=false;$('btnSTL').innerHTML='⬇ Download STL'}}
-renderLayers();updateInstr();
+async function exportSTL(){
+    if(!imgData)return;
+    $('btnSTL').disabled=true;$('btnSTL').innerHTML='<span class="spinner"></span>';
+    try{
+        const r=await fetch('/api/print/stl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:imgData,width:+$('w').value,total_height:+$('h').value,base_height:+$('b').value,border:2,contrast:1.5,denoise:2})});
+        if(!r.ok)throw new Error('Failed');
+        const blob=await r.blob(),a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);a.download='hueforge.stl';a.click();
+        $('stW').textContent=$('w').value+'mm';
+        $('stH').textContent=Math.round(+$('w').value*$('canvas').height/$('canvas').width)+'mm';
+    }catch(e){alert(e.message)}
+    finally{$('btnSTL').disabled=false;$('btnSTL').innerHTML='⬇ Download STL'}
+}
+
+function msg(type,text){const el=$('status');el.className='status '+type;el.textContent=text;setTimeout(()=>el.className='status',3000)}
+
+// Initialize with 2 colors
+setColors(2);
 </script></body></html>"""
+
 # === SHADOW (Silhouette -> STL for Shadow Box) ===
 def _shadow_extract_geometry(img, height_mm, threshold, smooth, foot_x, foot_y, foot_h, foot_width=57.969, cleanup=0.0, max_points=3000):
     if img.mode != "RGBA":
@@ -960,10 +1753,14 @@ def api_map_preview():
     try:
         d=request.json;lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
         mode=d['mode'];lw=d.get('lineWidth',1.2)
+        street_types=d.get('streetTypes',['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','track','path','footway','cycleway','bridleway','pedestrian'])
+        marker_type=d.get('markerType','none')
+        marker_size=d.get('markerSize',14)
+        marker_gap=d.get('markerGap',1)
         if mode=='streets':
-            gdf=fetch_streets(lat,lon,radius);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw);count=len(gdf)
+            gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker_type,marker_size,marker_gap);count=len(gdf)
         elif mode=='city':
-            mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5);count=len(fetch_buildings(lat,lon,radius))
+            gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_city_mesh_with_marker(gdf,lat,lon,radius,size,height,lw,1.0,1.5,marker_type,marker_size,marker_gap);count=len(fetch_buildings(lat,lon,radius))
         else:
             mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5);count=6400
         return jsonify({'vertices':mesh.vertices.flatten().tolist(),'faces':mesh.faces.flatten().tolist(),'count':count})
@@ -976,9 +1773,16 @@ def api_map_stl():
     try:
         d=request.json;lat,lon,radius,size,height=d['lat'],d['lon'],d['radius'],d['size'],d['height']
         mode=d['mode'];lw=d.get('lineWidth',1.2)
-        if mode=='streets':gdf=fetch_streets(lat,lon,radius);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw)
-        elif mode=='city':mesh=create_city_mesh(lat,lon,radius,size,height,lw,1.0,1.5)
-        else:mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
+        street_types=d.get('streetTypes',['motorway','trunk','primary','secondary','tertiary','residential','unclassified','service','track','path','footway','cycleway','bridleway','pedestrian'])
+        marker_type=d.get('markerType','none')
+        marker_size=d.get('markerSize',14)
+        marker_gap=d.get('markerGap',1)
+        if mode=='streets':
+            gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_streets_mesh(gdf,lat,lon,radius,size,height,lw,marker_type,marker_size,marker_gap)
+        elif mode=='city':
+            gdf=fetch_streets(lat,lon,radius,street_types);mesh=create_city_mesh_with_marker(gdf,lat,lon,radius,size,height,lw,1.0,1.5,marker_type,marker_size,marker_gap)
+        else:
+            mesh=create_terrain_mesh(lat,lon,radius,size,height*5,1.5)
         mesh.fill_holes();mesh.fix_normals();buf=io.BytesIO();mesh.export(buf,file_type='stl');buf.seek(0)
         return send_file(buf,mimetype='application/octet-stream',as_attachment=True,download_name='map.stl')
     except Exception as e:
